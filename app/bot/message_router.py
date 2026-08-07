@@ -1,9 +1,13 @@
 """
 Message router — onboarding flow + AI agent dispatch.
+Auto-injects latest uploaded document context into every AI call.
 """
 import logging
 import re
-from typing import List
+from typing import List, Optional
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.ai.agent import FinancialAgent
 from app.ai.prompts import ONBOARDING_COMPLETE, ONBOARDING_START
@@ -15,9 +19,33 @@ logger = logging.getLogger("finbot.router")
 STEP_KEY = "onboarding_step"
 
 
-async def route_text_message(db, user, text: str) -> str:
+async def _get_latest_document_context(db: AsyncSession, user_id: int) -> Optional[str]:
+    """Fetch the most recently uploaded document's content for context injection."""
+    from app.database import Document
+    result = await db.execute(
+        select(Document)
+        .where(Document.user_id == user_id)
+        .order_by(Document.created_at.desc())
+        .limit(1)
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        return None
+
+    # Build a rich context string the agent can use
+    context_parts = [f"📄 Uploaded Document: {doc.filename}"]
+    if doc.summary:
+        context_parts.append(f"Summary: {doc.summary}")
+    if doc.content:
+        context_parts.append(f"Full Content:\n{doc.content[:8000]}")
+
+    return "\n\n".join(context_parts)
+
+
+async def route_text_message(db: AsyncSession, user, text: str) -> str:
     text = text.strip()
 
+    # Google connect shortcut
     if text.lower() in ("/connect", "connect google", "link google"):
         auth_url = f"{settings.WEBHOOK_URL.rstrip('/')}/auth/google?user_id={user.id}"
         return (
@@ -29,12 +57,15 @@ async def route_text_message(db, user, text: str) -> str:
     if not user.onboarded:
         return await _run_onboarding(db, user, text)
 
+    # ── Always inject latest document context ──────────────────
     profile = await get_user_profile_dict(db, user.id)
+    document_context = await _get_latest_document_context(db, user.id)
+
     agent = FinancialAgent(db)
-    return await agent.process_message(user.id, text, profile)
+    return await agent.process_message(user.id, text, profile, document_context=document_context)
 
 
-async def _run_onboarding(db, user, text: str) -> str:
+async def _run_onboarding(db: AsyncSession, user, text: str) -> str:
     prefs = dict(user.preferences or {})
     step = int(prefs.get(STEP_KEY, 0))
 
