@@ -26,13 +26,21 @@ class DocumentService:
     ) -> Document:
         """Extract text from document and save to DB."""
         content = await self._extract_text(file_bytes, file_type, filename)
+
+        if not content or len(content.strip()) < 50:
+            # Last resort: try raw decode
+            try:
+                content = file_bytes.decode("utf-8", errors="ignore")
+            except Exception:
+                content = ""
+
         summary = await self._generate_summary(content, filename)
 
         doc = Document(
             user_id=user_id,
             filename=filename,
             file_type=file_type,
-            content=content[:50000],  # Limit stored content
+            content=content[:50000],
             summary=summary,
             metadata_={"size": len(file_bytes), "char_count": len(content)}
         )
@@ -42,55 +50,76 @@ class DocumentService:
         return doc
 
     async def _extract_text(self, file_bytes: bytes, file_type: str, filename: str) -> str:
-        """Extract text from PDF or Word document."""
-        try:
-            if file_type == "pdf" or filename.lower().endswith(".pdf"):
-                return await self._extract_pdf(file_bytes)
-            elif filename.lower().endswith((".docx", ".doc")):
-                return await self._extract_docx(file_bytes)
-            else:
-                # Try as plain text
-                return file_bytes.decode("utf-8", errors="ignore")
-        except Exception as e:
-            return f"Could not extract text: {str(e)}"
+        """Try multiple PDF extraction methods."""
+        text = ""
 
-    async def _extract_pdf(self, file_bytes: bytes) -> str:
-        """Extract text from PDF using pdfplumber."""
+        # Method 1: PyMuPDF (most reliable)
+        try:
+            import fitz
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            parts = []
+            for page in doc:
+                t = page.get_text()
+                if t:
+                    parts.append(t)
+            doc.close()
+            text = "\n\n".join(parts)
+            if len(text.strip()) > 100:
+                return text
+        except Exception as e:
+            pass
+
+        # Method 2: pdfplumber
         try:
             import pdfplumber
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                text_parts = []
-                for page in pdf.pages[:50]:  # Max 50 pages
-                    text = page.extract_text()
-                    if text:
-                        text_parts.append(text)
-                return "\n\n".join(text_parts)
+                parts = []
+                for page in pdf.pages[:50]:
+                    t = page.extract_text()
+                    if t:
+                        parts.append(t)
+                text = "\n\n".join(parts)
+                if len(text.strip()) > 100:
+                    return text
         except Exception:
-            try:
-                import fitz  # PyMuPDF
-                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                text = ""
-                for page in doc:
-                    text += page.get_text()
-                return text
-            except Exception as e:
-                return f"PDF extraction failed: {str(e)}"
+            pass
 
-    async def _extract_docx(self, file_bytes: bytes) -> str:
-        """Extract text from Word document."""
+        # Method 3: Raw text extraction (for text-based PDFs)
         try:
-            from docx import Document as DocxDocument
-            doc = DocxDocument(io.BytesIO(file_bytes))
-            return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-        except Exception as e:
-            return f"DOCX extraction failed: {str(e)}"
+            raw = file_bytes.decode("latin-1", errors="ignore")
+            # Extract text between stream markers
+            import re
+            streams = re.findall(r'BT(.*?)ET', raw, re.DOTALL)
+            extracted = []
+            for stream in streams:
+                words = re.findall(r'\((.*?)\)', stream)
+                if words:
+                    extracted.extend(words)
+            if extracted:
+                text = " ".join(extracted)
+                if len(text.strip()) > 50:
+                    return text
+        except Exception:
+            pass
+
+        # Method 4: docx
+        if filename.lower().endswith((".docx", ".doc")):
+            try:
+                from docx import Document as DocxDocument
+                doc = DocxDocument(io.BytesIO(file_bytes))
+                text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                if len(text.strip()) > 50:
+                    return text
+            except Exception:
+                pass
+
+        return text or ""
 
     async def _generate_summary(self, content: str, filename: str) -> str:
         """Generate a structured summary of the document."""
-        if not content or len(content) < 100:
-            return "Document appears to be empty or could not be parsed."
+        if not content or len(content.strip()) < 50:
+            return "Document could not be parsed. Please try uploading again or use a text-based PDF."
 
-        # Use first 8000 chars for summary
         excerpt = content[:8000]
         try:
             response = await client.chat.completions.create(
@@ -112,7 +141,7 @@ Be concise and focused on what a finance professional needs to know."""
                 max_tokens=600,
                 temperature=0.2
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content or "Summary not available."
         except Exception as e:
             return f"Summary generation failed: {str(e)}"
 
@@ -123,27 +152,26 @@ Be concise and focused on what a finance professional needs to know."""
         document_id: Optional[int] = None
     ) -> dict:
         """Answer a question about a document."""
-        # Get document(s)
         if document_id:
             result = await self.db.execute(
-                select(Document).where(Document.id == document_id, Document.user_id == user_id)
+                select(Document).where(
+                    Document.id == document_id,
+                    Document.user_id == user_id
+                )
             )
             doc = result.scalar_one_or_none()
-            docs = [doc] if doc else []
         else:
-            # Get most recent document
             result = await self.db.execute(
                 select(Document)
                 .where(Document.user_id == user_id)
                 .order_by(Document.created_at.desc())
                 .limit(1)
             )
-            docs = result.scalars().all()
+            doc = result.scalars().first()
 
-        if not docs:
+        if not doc:
             return {"answer": "No document found. Please upload a document first.", "found": False}
 
-        doc = docs[0]
         content_excerpt = (doc.content or "")[:12000]
 
         try:
@@ -152,7 +180,12 @@ Be concise and focused on what a finance professional needs to know."""
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a financial document analyst. Answer questions accurately based only on the provided document content. If information is not in the document, say so clearly."
+                        "content": (
+                            "You are a financial document analyst. "
+                            "Answer questions accurately based ONLY on the provided document content. "
+                            "If information is in the document, answer directly with specific numbers and facts. "
+                            "If not found, say so clearly."
+                        )
                     },
                     {
                         "role": "user",
@@ -162,9 +195,8 @@ Be concise and focused on what a finance professional needs to know."""
                 max_tokens=800,
                 temperature=0.1
             )
-            answer = response.choices[0].message.content
             return {
-                "answer": answer,
+                "answer": response.choices[0].message.content,
                 "document": doc.filename,
                 "found": True
             }
@@ -172,7 +204,6 @@ Be concise and focused on what a finance professional needs to know."""
             return {"error": str(e), "found": True}
 
     async def get_user_documents(self, user_id: int) -> list:
-        """Get list of user's uploaded documents."""
         result = await self.db.execute(
             select(Document)
             .where(Document.user_id == user_id)
@@ -180,4 +211,12 @@ Be concise and focused on what a finance professional needs to know."""
             .limit(10)
         )
         docs = result.scalars().all()
-        return [{"id": d.id, "filename": d.filename, "type": d.file_type, "uploaded": d.created_at.isoformat()} for d in docs]
+        return [
+            {
+                "id": d.id,
+                "filename": d.filename,
+                "type": d.file_type,
+                "uploaded": d.created_at.isoformat()
+            }
+            for d in docs
+        ]
