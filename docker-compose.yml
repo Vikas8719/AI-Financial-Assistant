@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  # ── FinBot API ─────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finbot-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://finbot:finbot_pass@postgres:5432/finbot
+      - SYNC_DATABASE_URL=postgresql://finbot:finbot_pass@postgres:5432/finbot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - finbot-net
+    volumes:
+      - ./:/app   # Remove in production
+
+  # ── PostgreSQL + pgvector ──────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: finbot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: finbot
+      POSTGRES_PASSWORD: finbot_pass
+      POSTGRES_DB: finbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finbot -d finbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - finbot-net
+
+networks:
+  finbot-net:
+    driver: bridge
+
+volumes:
+  pgdata:

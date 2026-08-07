@@ -1,0 +1,55 @@
+# Core
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-dotenv==1.0.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Telegram
+python-telegram-bot==21.9
+
+# AI / LLM
+groq==0.13.0
+openai==1.58.1
+tiktoken==0.8.0
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+alembic==1.14.0
+pgvector==0.3.6
+
+# Financial Data
+finnhub-python==2.4.20
+yfinance==0.2.51
+requests==2.32.3
+httpx==0.28.1
+
+# Web Search
+tavily-python==0.5.0
+duckduckgo-search==7.2.1
+
+# Document Intelligence
+pymupdf==1.25.1
+pdfplumber==0.11.4
+python-docx==1.1.2
+
+# Scheduler
+apscheduler==3.10.4
+
+# Audio / Voice (openai-whisper removed — using Groq Whisper API instead)
+pydub==0.25.1
+
+# Google OAuth & APIs
+google-auth==2.37.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.155.0
+
+# Utilities
+aiofiles==24.1.0
+python-multipart==0.0.20
+numpy==1.26.4
+pandas==2.2.3
+pytz==2024.2
