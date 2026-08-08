@@ -11,7 +11,7 @@ from telegram import Bot
 
 from app.api.routes import router as api_router
 from app.config import settings
-from app.database import init_db
+from app.database import init_db, AsyncSessionLocal
 from app.scheduler.jobs import start_scheduler, shutdown_scheduler
 
 logging.basicConfig(
@@ -28,6 +28,15 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("✅ Database initialised")
 
+    # Setup PostgreSQL FTS indexes for vectorless RAG
+    try:
+        from app.ai.rag_engine import setup_fts_indexes
+        async with AsyncSessionLocal() as db:
+            await setup_fts_indexes(db)
+        logger.info("✅ BM25 full-text search indexes ready")
+    except Exception as e:
+        logger.warning(f"⚠️  FTS index setup warning (non-fatal): {e}")
+
     if settings.WEBHOOK_URL:
         try:
             bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
@@ -39,8 +48,9 @@ async def lifespan(app: FastAPI):
 
     start_scheduler()
     logger.info("✅ Scheduler started")
+    logger.info("🤖 RAG Pipeline: BM25 → llama-3.1-8b-instant reranker → llama-3.3-70b-versatile")
 
-    yield  # App is running
+    yield
 
     # ── Shutdown ─────────────────────────────────────────────
     logger.info("🛑 FinBot shutting down...")
@@ -50,7 +60,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="FinBot — AI Financial Assistant",
     description="AI-powered financial assistant living inside Telegram.",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url=None,
@@ -68,4 +78,9 @@ app.include_router(api_router)
 
 @app.get("/", include_in_schema=False)
 async def root():
-    return {"status": "FinBot is running 🤖", "version": "1.0.0"}
+    return {
+        "status": "FinBot is running 🤖",
+        "version": "2.0.0",
+        "rag": "BM25 + LLM Reranker (llama-3.1-8b-instant)",
+        "main_llm": "llama-3.3-70b-versatile"
+    }

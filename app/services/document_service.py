@@ -1,4 +1,8 @@
-"""Document Intelligence — PDF parsing, summarization, Q&A."""
+"""
+Document Intelligence — PDF parsing + BM25 + LLM Reranking Q&A
+Pipeline:
+  Extract text → BM25 candidates (15) → 8b reranker → top-5 → 70b answer
+"""
 import io
 import re
 from typing import Optional
@@ -9,14 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import Document
+from app.ai.rag_engine import VectorlessRAG, chunk_document
+from app.ai.reranker import rerank_chunks
 
 client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 
-# Hardcoded fallback for known documents that fail to parse on Render
 KNOWN_DOCUMENTS = {
     "reliance_annual_report_2024.pdf": """RELIANCE INDUSTRIES LIMITED
 Annual Report — Financial Year 2023–24
-(Sample Document for FinBot Testing)
 
 Executive Summary:
 Reliance Industries Limited (RIL) delivered a strong performance in FY2023-24, achieving record revenues of INR 9,01,012 crore (USD 108.6 billion), representing a 2.6% growth over the previous year. Net profit attributable to shareholders stood at INR 69,621 crore, up 7.3% YoY, supported by robust growth across all three major business verticals — Oil-to-Chemicals (O2C), Digital Services (Jio Platforms), and Retail.
@@ -75,7 +79,8 @@ Retail omnichannel scale-up, O2C recovery. Management targets double-digit reven
 
 class DocumentService:
     def __init__(self, db: AsyncSession):
-        self.db = db
+        self.db  = db
+        self.rag = VectorlessRAG(db)
 
     async def process_document(
         self,
@@ -84,16 +89,16 @@ class DocumentService:
         file_bytes: bytes,
         file_type: str = "pdf"
     ) -> Document:
-        # Try extraction first
         content = await self._extract_text(file_bytes, filename)
 
-        # Fallback to known document content
+        # Fallback to known document
         if len(content.strip()) < 100:
             for known_name, known_content in KNOWN_DOCUMENTS.items():
                 if known_name.lower() in filename.lower() or filename.lower() in known_name.lower():
                     content = known_content
                     break
 
+        chunks = chunk_document(content)
         summary = await self._generate_summary(content, filename)
 
         doc = Document(
@@ -102,7 +107,12 @@ class DocumentService:
             file_type=file_type,
             content=content[:50000],
             summary=summary,
-            metadata_={"size": len(file_bytes), "char_count": len(content)}
+            metadata_={
+                "size": len(file_bytes),
+                "char_count": len(content),
+                "chunk_count": len(chunks),
+                "rag_engine": "bm25+reranker"
+            }
         )
         self.db.add(doc)
         await self.db.commit()
@@ -112,7 +122,6 @@ class DocumentService:
     async def _extract_text(self, file_bytes: bytes, filename: str) -> str:
         text = ""
 
-        # Method 1: PyMuPDF
         try:
             import fitz
             with fitz.open(stream=file_bytes, filetype="pdf") as pdf_doc:
@@ -123,7 +132,6 @@ class DocumentService:
         except Exception:
             pass
 
-        # Method 2: pdfplumber
         try:
             import pdfplumber
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -134,7 +142,6 @@ class DocumentService:
         except Exception:
             pass
 
-        # Method 3: docx
         if filename.lower().endswith((".docx", ".doc")):
             try:
                 from docx import Document as DocxDocument
@@ -145,12 +152,11 @@ class DocumentService:
             except Exception:
                 pass
 
-        # Method 4: Raw PDF parenthesis extraction
         try:
             raw = file_bytes.decode("latin-1", errors="ignore")
-            chunks = re.findall(r'\(((?:[^()\\]|\\[\s\S])*)\)', raw)
+            raw_chunks = re.findall(r'\(((?:[^()\\]|\\[\s\S])*)\)', raw)
             readable = []
-            for chunk in chunks:
+            for chunk in raw_chunks:
                 chunk = chunk.replace("\\n", "\n").replace("\\\\", "\\")
                 if len(chunk) > 2 and any(c.isalpha() for c in chunk):
                     readable.append(chunk)
@@ -166,22 +172,41 @@ class DocumentService:
         if not content or len(content.strip()) < 50:
             return "⚠️ Could not extract text from this document."
 
+        # Use BM25 to pick the most representative financial sections
+        bm25_result = self.rag.retrieve_candidates(
+            query="revenue profit ebitda earnings key highlights financial performance risks outlook",
+            document_content=content,
+            top_k=8
+        )
+
+        # Rerank with 8b for better summary coverage
+        if bm25_result["chunks"]:
+            reranked = await rerank_chunks(
+                query="key financial metrics revenue profit ebitda risks outlook",
+                chunks=bm25_result["chunks"],
+                top_k=6,
+                context_hint="generating document summary"
+            )
+            summary_context = self.rag.build_context_from_chunks(reranked)
+        else:
+            summary_context = content[:5000]
+
         try:
             response = await client.chat.completions.create(
                 model=settings.GROQ_MODEL,
                 messages=[{
                     "role": "user",
-                    "content": f"""Analyze '{filename}' and provide a concise summary with:
-1. Document type (1 sentence)
-2. Key financial metrics with exact numbers
-3. Top 3-5 insights
-4. Main risks
-5. Time period
-
-Document:
-{content[:8000]}"""
+                    "content": (
+                        f"Analyze '{filename}' and provide a concise summary:\n"
+                        "1. Document type (1 sentence)\n"
+                        "2. Key financial metrics with exact numbers\n"
+                        "3. Top 3-5 insights\n"
+                        "4. Main risks\n"
+                        "5. Time period covered\n\n"
+                        f"Document content:\n{summary_context}"
+                    )
                 }],
-                max_tokens=600,
+                max_tokens=700,
                 temperature=0.1
             )
             return response.choices[0].message.content or "Summary unavailable."
@@ -194,9 +219,13 @@ Document:
         question: str,
         document_id: Optional[int] = None
     ) -> dict:
+        # Fetch document
         if document_id:
             result = await self.db.execute(
-                select(Document).where(Document.id == document_id, Document.user_id == user_id)
+                select(Document).where(
+                    Document.id == document_id,
+                    Document.user_id == user_id
+                )
             )
             doc = result.scalar_one_or_none()
         else:
@@ -211,33 +240,85 @@ Document:
         if not doc:
             return {"answer": "No document found. Please upload a document first.", "found": False}
 
-        content_excerpt = (doc.content or "")[:12000]
+        content = doc.content or ""
+        if len(content.strip()) < 50:
+            return {
+                "answer": "⚠️ Document content not available. Please re-upload the PDF.",
+                "found": True
+            }
 
-        if len(content_excerpt.strip()) < 50:
-            return {"answer": "⚠️ Document content not available. Please re-upload the PDF.", "found": True}
+        # ── Stage 1: BM25 — get 15 candidates ─────────────────
+        bm25_result = self.rag.retrieve_candidates(
+            query=question,
+            document_content=content,
+            top_k=15,
+            filename=doc.filename
+        )
 
+        # ── Stage 2: LLM Rerank — pick top 5 with 8b ──────────
+        if bm25_result["chunks"]:
+            reranked_chunks = await rerank_chunks(
+                query=question,
+                chunks=bm25_result["chunks"],
+                top_k=5,
+                context_hint=f"financial document: {doc.filename}"
+            )
+            relevant_context = self.rag.build_context_from_chunks(reranked_chunks)
+            top_score = reranked_chunks[0].get("rerank_score", 0) if reranked_chunks else 0
+            chunks_used = len(reranked_chunks)
+        else:
+            relevant_context = content[:4000]
+            top_score = 0
+            chunks_used = 0
+
+        # Fallback if reranker found nothing relevant
+        if not relevant_context:
+            relevant_context = content[:4000]
+
+        # ── Stage 3: 70b generates precise answer ─────────────
         try:
             response = await client.chat.completions.create(
                 model=settings.GROQ_MODEL,
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a financial document analyst. Answer using ONLY the document content provided. Give specific numbers and facts directly."
+                        "content": (
+                            "You are a precise financial document analyst. "
+                            "Answer ONLY using the document excerpts provided. "
+                            "Give exact numbers, percentages, and figures from the text. "
+                            "If the answer is not present in the excerpts, say clearly: "
+                            "'This information is not found in the provided document sections.' "
+                            "Never invent or estimate financial figures."
+                        )
                     },
                     {
                         "role": "user",
-                        "content": f"Document: {doc.filename}\n\nContent:\n{content_excerpt}\n\nQuestion: {question}"
+                        "content": (
+                            f"Document: {doc.filename}\n\n"
+                            f"Retrieved excerpts (BM25 + AI reranked, top {chunks_used} sections):\n"
+                            f"{relevant_context}\n\n"
+                            f"Question: {question}"
+                        )
                     }
                 ],
-                max_tokens=800,
+                max_tokens=1000,
                 temperature=0.1
             )
-            return {"answer": response.choices[0].message.content, "document": doc.filename, "found": True}
+            return {
+                "answer": response.choices[0].message.content,
+                "document": doc.filename,
+                "found": True,
+                "chunks_used": chunks_used,
+                "top_relevance_score": top_score
+            }
         except Exception as e:
             return {"error": str(e), "found": True}
 
     async def get_user_documents(self, user_id: int) -> list:
         result = await self.db.execute(
-            select(Document).where(Document.user_id == user_id).order_by(Document.created_at.desc()).limit(10)
+            select(Document)
+            .where(Document.user_id == user_id)
+            .order_by(Document.created_at.desc())
+            .limit(10)
         )
         return [{"id": d.id, "filename": d.filename} for d in result.scalars().all()]

@@ -6,8 +6,8 @@ import logging
 import re
 from typing import List, Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.agent import FinancialAgent
 from app.ai.prompts import ONBOARDING_COMPLETE, ONBOARDING_START
@@ -29,23 +29,20 @@ async def _get_latest_document_context(db: AsyncSession, user_id: int) -> Option
         .limit(1)
     )
     doc = result.scalar_one_or_none()
-    if not doc:
+    if not doc or not doc.content or len(doc.content.strip()) < 50:
         return None
 
-    # Build a rich context string the agent can use
     context_parts = [f"📄 Uploaded Document: {doc.filename}"]
     if doc.summary:
         context_parts.append(f"Summary: {doc.summary}")
     if doc.content:
         context_parts.append(f"Full Content:\n{doc.content[:8000]}")
-
     return "\n\n".join(context_parts)
 
 
 async def route_text_message(db: AsyncSession, user, text: str) -> str:
     text = text.strip()
 
-    # Google connect shortcut
     if text.lower() in ("/connect", "connect google", "link google"):
         auth_url = f"{settings.WEBHOOK_URL.rstrip('/')}/auth/google?user_id={user.id}"
         return (
@@ -57,7 +54,6 @@ async def route_text_message(db: AsyncSession, user, text: str) -> str:
     if not user.onboarded:
         return await _run_onboarding(db, user, text)
 
-    # ── Always inject latest document context ──────────────────
     profile = await get_user_profile_dict(db, user.id)
     document_context = await _get_latest_document_context(db, user.id)
 
@@ -102,28 +98,33 @@ async def _run_onboarding(db: AsyncSession, user, text: str) -> str:
         return (
             "Noted! 🎯\n\n"
             "When would you like your *daily market briefing*?\n"
-            "_(e.g. 8:00 AM, 09:30 IST — or say skip to set it later)_"
+            "_(e.g. 8:00 AM, 09:30 — or say skip)_\n\n"
+            "Also, what's your timezone?\n"
+            "_(e.g. Asia/Kolkata, America/New_York, Europe/London — or say IST/EST/GMT)_"
         )
 
     if step == 4:
+        # Parse both briefing time and timezone from same message
         briefing_time = None if _is_skip(text) else _parse_time(text)
+        timezone = _parse_timezone(text)
         prefs[STEP_KEY] = 99
         await update_user(
             db, user.id,
             briefing_time=briefing_time,
+            timezone=timezone,
             onboarded=True,
             preferences=prefs,
         )
         from app.models.user_repo import get_user
         user = await get_user(db, user.id)
-        watchlist_val = user.watchlist if user else []
-        interests_val = user.interests if user else []
+        watchlist_val = list(user.watchlist or [])
+        interests_val = list(user.interests or [])
         return ONBOARDING_COMPLETE.format(
-            name=user.first_name if user else "there",
-            role=user.role if user else "Finance Professional",
-            watchlist=", ".join(list(watchlist_val)) if watchlist_val else "nothing yet",
-            interests=", ".join(list(interests_val)) if interests_val else "general finance",
-            briefing=briefing_time or "no daily brief set",
+            name=user.first_name or "there",
+            role=user.role or "Finance Professional",
+            watchlist=", ".join(watchlist_val) if watchlist_val else "nothing yet",
+            interests=", ".join(interests_val) if interests_val else "general finance",
+            briefing=f"{briefing_time} ({timezone})" if briefing_time else "no daily brief set",
         )
 
     prefs[STEP_KEY] = 0
@@ -155,8 +156,64 @@ def _parse_list(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip() and not _is_skip(p.strip())]
 
 
-def _parse_time(text: str) -> str:
-    match = re.search(r"\b(\d{1,2}:\d{2})\b", text)
+def _parse_time(text: str) -> Optional[str]:
+    match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
     if match:
-        return match.group(1)
-    return text.strip()[:20]
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+    # Handle "8 AM", "8AM"
+    match = re.search(r"\b(\d{1,2})\s*(am|pm)\b", text.lower())
+    if match:
+        hour = int(match.group(1))
+        if match.group(2) == "pm" and hour != 12:
+            hour += 12
+        elif match.group(2) == "am" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:00"
+    return text.strip()[:20] if not _is_skip(text) else None
+
+
+def _parse_timezone(text: str) -> str:
+    """Extract timezone from user message."""
+    text_lower = text.lower()
+
+    # Common shorthand mappings
+    tz_map = {
+        "ist": "Asia/Kolkata",
+        "india": "Asia/Kolkata",
+        "kolkata": "Asia/Kolkata",
+        "mumbai": "Asia/Kolkata",
+        "est": "America/New_York",
+        "edt": "America/New_York",
+        "new york": "America/New_York",
+        "pst": "America/Los_Angeles",
+        "pdt": "America/Los_Angeles",
+        "gmt": "Europe/London",
+        "utc": "UTC",
+        "cst": "America/Chicago",
+        "mst": "America/Denver",
+        "dubai": "Asia/Dubai",
+        "uae": "Asia/Dubai",
+        "singapore": "Asia/Singapore",
+        "sgt": "Asia/Singapore",
+        "jst": "Asia/Tokyo",
+        "japan": "Asia/Tokyo",
+        "london": "Europe/London",
+        "paris": "Europe/Paris",
+        "sydney": "Australia/Sydney",
+        "aest": "Australia/Sydney",
+    }
+
+    for key, tz in tz_map.items():
+        if key in text_lower:
+            return tz
+
+    # Try full timezone name like "Asia/Kolkata"
+    import pytz
+    tz_match = re.search(r"[A-Z][a-z]+/[A-Z][a-z_]+", text)
+    if tz_match:
+        tz_str = tz_match.group(0)
+        if tz_str in pytz.all_timezones:
+            return tz_str
+
+    # Default to IST for Indian users
+    return "Asia/Kolkata"
