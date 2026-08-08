@@ -182,7 +182,7 @@ async def _generate_brief(profile: dict, market_bundle: dict, groq_client) -> st
         prompt += f"\n\nEarnings reports due today: {json.dumps(earnings, ensure_ascii=False)}"
 
     response = await groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",    # Main model for quality
+        model="openai/gpt-oss-120b",    # Main model for quality
         messages=[{"role": "user", "content": prompt}],
         max_tokens=700,
         temperature=0.45    # Creative type — fluent, engaging narrative

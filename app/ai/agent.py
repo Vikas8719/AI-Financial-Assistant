@@ -21,8 +21,8 @@ from app.services.yahoo_finance import YahooFinanceService
 from app.services.sec_edgar import SecEdgarService
 from app.services.web_search import WebSearchService
 
-RERANKER_MODEL = "llama-3.1-8b-instant"
-MAIN_MODEL     = "llama-3.3-70b-versatile"
+RERANKER_MODEL = "openai/gpt-oss-20b"
+MAIN_MODEL     = "openai/gpt-oss-120b"
 
 main_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 finnhub     = FinnhubService()

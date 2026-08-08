@@ -1,9 +1,9 @@
 """
-LLM Reranker — llama-3.1-8b-instant on Groq
+LLM Reranker — openai/gpt-oss-20b on Groq
 ─────────────────────────────────────────────
 Pipeline:
   1. BM25 retrieves top-15 candidate chunks (fast, no API call)
-  2. llama-3.1-8b-instant reranks them (tiny model, 1-2s, near-zero tokens)
+  2. openai/gpt-oss-20b reranks them (tiny model, 1-2s, near-zero tokens)
   3. Top-5 go to main 70b LLM as pinned context
 
 Why separate model for reranking?
@@ -21,8 +21,8 @@ from groq import AsyncGroq
 from app.config import settings
 
 # ── Model config ──────────────────────────────────────────────
-RERANKER_MODEL = "llama-3.1-8b-instant"   # Fast, cheap reranker
-MAIN_MODEL = "llama-3.3-70b-versatile"    # Main answer model
+RERANKER_MODEL = "openai/gpt-oss-20b"   # Fast, cheap reranker
+MAIN_MODEL = "openai/gpt-oss-120b"    # Main answer model
 
 # Safety: if Groq rate-limits the reranker, fall back to BM25 scores
 RERANKER_TIMEOUT = 8.0  # seconds
@@ -41,7 +41,7 @@ async def rerank_chunks(
     context_hint: str = ""
 ) -> list[dict]:
     """
-    Rerank BM25 candidate chunks using llama-3.1-8b-instant.
+    Rerank BM25 candidate chunks using openai/gpt-oss-20b.
 
     Scoring strategy: pointwise — model assigns 0-10 relevance score
     to each chunk independently. Fast, parallelisable, deterministic.
@@ -137,7 +137,7 @@ async def rerank_memory(
     top_k: int = 3
 ) -> list[str]:
     """
-    Rerank past conversation memories using llama-3.1-8b-instant.
+    Rerank past conversation memories using openai/gpt-oss-20b.
     Keeps only genuinely relevant memories for context injection.
 
     Args:

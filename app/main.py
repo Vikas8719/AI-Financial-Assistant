@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
 
     start_scheduler()
     logger.info("✅ Scheduler started")
-    logger.info("🤖 RAG Pipeline: BM25 → llama-3.1-8b-instant reranker → llama-3.3-70b-versatile")
+    logger.info("🤖 RAG Pipeline: BM25 → openai/gpt-oss-20b reranker → openai/gpt-oss-120b")
 
     yield
 
@@ -81,6 +81,6 @@ async def root():
     return {
         "status": "FinBot is running 🤖",
         "version": "2.0.0",
-        "rag": "BM25 + LLM Reranker (llama-3.1-8b-instant)",
-        "main_llm": "llama-3.3-70b-versatile"
+        "rag": "BM25 + LLM Reranker (openai/gpt-oss-20b)",
+        "main_llm": "openai/gpt-oss-120b"
     }

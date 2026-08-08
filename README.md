@@ -23,7 +23,7 @@ PostgreSQL (Neon · pgvector)
 
 - **Backend:** FastAPI (Python)
 - **Database:** PostgreSQL with pgvector (Neon)
-- **AI:** Groq LLM (llama-3.3-70b-versatile)
+- **AI:** Groq LLM (openai/gpt-oss-120b)
 - **Memory:** pgvector semantic search
 - **Telegram:** python-telegram-bot
 - **Scheduler:** APScheduler
