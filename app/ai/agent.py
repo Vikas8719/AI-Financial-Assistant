@@ -1,16 +1,5 @@
 """
 Main AI Agent — 4-Stage Pipeline
-─────────────────────────────────────────────────────────────────────
-Stage 1 │ Document: BM25 candidates (15)                    │ 0ms
-Stage 2 │ Memory: pgvector (semantic) + BM25 (keyword)      │ ~0.5s (concurrent)
-Stage 3 │ llama-3.1-8b-instant reranker → doc top-5         │ ~1s
-         │                               → memory top-3     │ (same call batch)
-Stage 4 │ llama-3.3-70b-versatile → final answer            │ ~2s
-─────────────────────────────────────────────────────────────────────
-Memory strategy:
-  pgvector  → "earnings decline" matches "profit fell" (semantic)
-  BM25      → "AAPL", "INR 9,01,012", "EBITDA 19.8%" (exact)
-  Reranker  → picks only genuinely relevant memories
 """
 import json
 import re
@@ -43,51 +32,147 @@ search      = WebSearchService()
 
 
 # ──────────────────────────────────────────────────────────────
-#  Query Classifier
+#  Query Classifier — Fixed
 # ──────────────────────────────────────────────────────────────
 
+# Short conversational messages that should NEVER be analytical
+CONVERSATIONAL_OVERRIDES = {
+    "hi", "hello", "hey", "hii", "helo", "hola",
+    "how are you", "how r u", "how are you doing",
+    "good morning", "good evening", "good night", "good afternoon",
+    "thanks", "thank you", "ok", "okay", "sure", "got it",
+    "bye", "goodbye", "see you", "later", "yes", "no", "yep", "nope",
+    "what's up", "whats up", "sup", "wassup",
+    "help", "what can you do", "what do you do",
+}
+
+
+def _is_conversational_override(q: str) -> bool:
+    """Check if query is purely conversational — before any pattern matching."""
+    q_stripped = q.strip().lower().rstrip("!?.,:;")
+
+    # Direct match
+    if q_stripped in CONVERSATIONAL_OVERRIDES:
+        return True
+
+    # Short greeting patterns (under 5 words)
+    words = q_stripped.split()
+    if len(words) <= 4:
+        greeting_words = {"hi", "hello", "hey", "hii", "helo", "greetings", "howdy"}
+        if words[0] in greeting_words:
+            return True
+        # "how are you *" with <= 4 words
+        if len(words) >= 3 and words[0] == "how" and words[1] == "are":
+            return True
+
+    return False
+
+
+def _sanitize_ts_query(tokens: list[str]) -> str:
+    """
+    ✅ FIX for Bug 2: Sanitize tokens before building PostgreSQL ts_query.
+
+    Removes/escapes characters that crash PostgreSQL FTS:
+    - & (AND operator)
+    - | (OR operator)
+    - ! (NOT operator)
+    - ( ) (grouping)
+    - : (lexeme weight)
+    - * (prefix match — only valid at end)
+    - ? (not valid in tsquery)
+    - ' (quote)
+    - " (double quote)
+    - Numbers-only tokens (no lexeme value)
+    - Empty strings
+
+    Returns a safe OR-joined ts_query string.
+    """
+    INVALID_CHARS = re.compile(r"[&|!():*?'\"\\/]")
+    safe_tokens = []
+
+    for token in tokens:
+        # Strip invalid chars
+        cleaned = INVALID_CHARS.sub("", token).strip()
+
+        # Skip empty, numbers-only, or too-short tokens
+        if not cleaned or len(cleaned) < 2:
+            continue
+        if cleaned.isdigit():
+            continue
+
+        # Must have at least one alphabetic character
+        if not any(c.isalpha() for c in cleaned):
+            continue
+
+        safe_tokens.append(cleaned)
+
+    if not safe_tokens:
+        return ""
+
+    # Use OR (|) joining — more permissive, better recall
+    return " | ".join(safe_tokens[:8])
+
+
 def classify_query(query: str) -> str:
+    """
+    ✅ FIX for Bug 1: Check conversational overrides FIRST.
+
+    Problem was: 'how' in analytical patterns caused
+    'Hello how are you' → 'analytical' (WRONG)
+
+    Fix: short greetings and casual phrases are intercepted
+    before any regex pattern matching runs.
+    """
     q = query.lower().strip()
 
-    factual = [
+    # ── STEP 1: Conversational override (must come FIRST) ──────
+    if _is_conversational_override(q):
+        return "conversational"
+
+    # ── STEP 2: Factual — specific data points ──────────────────
+    factual_patterns = [
         r'\bprice\b', r'\bstock\b', r'\bquote\b', r'\beps\b', r'\bpe\b',
         r'\bmarket cap\b', r'\bdividend\b', r'\bearning[s]?\b', r'\brevenue\b',
         r'\bprofit\b', r'\bebitda\b', r'\bdebt\b', r'\bshare price\b',
-        r'\b52.week\b', r'\bvolume\b', r'\bopen\b', r'\bclose\b',
-        r'\bhigh\b', r'\blow\b', r'\bchange\b', r'\bpercent\b',
-        r'\b%\b', r'\bcrore\b', r'\bbillion\b', r'\bmillion\b',
-        r'\byield\b', r'\brate\b', r'\bsubscriber[s]?\b', r'\barpu\b'
+        r'\b52.week\b', r'\bvolume\b', r'\bcrore\b', r'\bbillion\b',
+        r'\bmillion\b', r'\byield\b', r'\bsubscriber[s]?\b', r'\barpu\b',
+        r'\beps\b', r'\broe\b', r'\broa\b', r'\bcash\b', r'\bmargin\b',
     ]
-    if any(re.search(p, q) for p in factual):
+    if any(re.search(p, q) for p in factual_patterns):
         return "factual"
 
-    document = [
+    # ── STEP 3: Document — report/filing queries ─────────────────
+    document_patterns = [
         r'\bdocument\b', r'\breport\b', r'\bfiling\b', r'\b10.?k\b',
         r'\b10.?q\b', r'\bannual\b', r'\bpdf\b', r'\bpage\b',
         r'\baccording to\b', r'\bstated\b', r'\bmentioned\b',
-        r'\bsec\b', r'\bedgar\b', r'\baudit\b', r'\bnote\b'
+        r'\bsec\b', r'\bedgar\b', r'\baudit\b',
     ]
-    if any(re.search(p, q) for p in document):
+    if any(re.search(p, q) for p in document_patterns):
         return "document"
 
-    analytical = [
+    # ── STEP 4: Analytical — compare/analyze/explain ─────────────
+    # NOTE: 'how' removed — causes false positives on "how are you"
+    # Use more specific multi-word patterns for how-based queries
+    analytical_patterns = [
         r'\banalyze\b', r'\banalysis\b', r'\bcompare\b', r'\bvs\b',
-        r'\bversus\b', r'\bwhy\b', r'\bhow\b', r'\bexplain\b',
-        r'\bunderstand\b', r'\boutlook\b', r'\bforecast\b',
+        r'\bversus\b', r'\bwhy\b', r'\bhow (does|did|do|is|was|will|can|much|many)\b',
+        r'\bexplain\b', r'\bunderstand\b', r'\boutlook\b', r'\bforecast\b',
         r'\bguidance\b', r'\brisk\b', r'\bopportunity\b',
         r'\bcompetitor\b', r'\bindustry\b', r'\bsector\b',
         r'\btrend\b', r'\bperformance\b', r'\bgrowth\b',
-        r'\bstrategy\b', r'\bvaluation\b', r'\bimpact\b'
+        r'\bstrategy\b', r'\bvaluation\b', r'\bimpact\b',
     ]
-    if any(re.search(p, q) for p in analytical):
+    if any(re.search(p, q) for p in analytical_patterns):
         return "analytical"
 
-    creative = [
+    # ── STEP 5: Creative — summaries, news briefs ────────────────
+    creative_patterns = [
         r'\bsummariz\b', r'\bbrief\b', r'\boverview\b', r'\bdigest\b',
         r'\btop news\b', r'\bmorning\b', r'\bwhat.s happening\b',
-        r'\bupdate me\b', r'\bwhat happened\b'
+        r'\bupdate me\b', r'\bwhat happened\b',
     ]
-    if any(re.search(p, q) for p in creative):
+    if any(re.search(p, q) for p in creative_patterns):
         return "creative"
 
     return "conversational"
@@ -127,12 +212,10 @@ class FinancialAgent:
         document_context: Optional[str] = None
     ) -> str:
 
-        # ── Stage 0: Classify query ────────────────────────────
         query_type  = classify_query(user_message)
         temperature = TEMPERATURE_MAP[query_type]
         max_tokens  = MAX_TOKENS_MAP[query_type]
 
-        # ── Stage 1: BM25 over document + Hybrid memory (concurrent) ──
         import asyncio
 
         async def _doc_retrieval():
@@ -145,7 +228,6 @@ class FinancialAgent:
             )
 
         async def _memory_retrieval():
-            # Hybrid: pgvector (semantic) + BM25 (keyword) merged
             return await search_memory_hybrid(
                 db=self.db,
                 user_id=user_id,
@@ -153,13 +235,11 @@ class FinancialAgent:
                 top_k=8
             )
 
-        # Run both concurrently — saves ~0.5s
         doc_result, hybrid_memories = await asyncio.gather(
             _doc_retrieval(),
             _memory_retrieval()
         )
 
-        # ── Stage 2a: Rerank document chunks (8b) ─────────────
         final_doc_context = ""
         doc_chunks_used   = 0
 
@@ -179,7 +259,6 @@ class FinancialAgent:
                 temperature = TEMPERATURE_MAP["document"]
                 max_tokens  = MAX_TOKENS_MAP["document"]
 
-        # ── Stage 2b: Rerank hybrid memories (8b) ─────────────
         rag_memory = ""
         if hybrid_memories:
             relevant_memories = await rerank_memory(
@@ -194,7 +273,6 @@ class FinancialAgent:
                     lines.append(f"[Memory {i}]: {snippet}")
                 rag_memory = "\n".join(lines)
 
-        # ── Build system prompt ────────────────────────────────
         history = await get_recent_history(self.db, user_id, limit=10)
         now     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         user_profile_str = json.dumps(user_profile, ensure_ascii=False)
@@ -203,14 +281,11 @@ class FinancialAgent:
 
         if final_doc_context:
             context_parts.append(
-                f"\n📄 DOCUMENT EXCERPTS — BM25 retrieved, AI reranked "
-                f"({doc_chunks_used} sections):\n\n{final_doc_context[:4500]}"
+                f"\n📄 DOCUMENT EXCERPTS ({doc_chunks_used} sections):\n\n{final_doc_context[:4500]}"
             )
 
         if rag_memory:
-            context_parts.append(
-                f"\n🧠 RELEVANT PAST CONTEXT — pgvector + BM25 hybrid, AI reranked:\n{rag_memory}"
-            )
+            context_parts.append(f"\n🧠 RELEVANT PAST CONTEXT:\n{rag_memory}")
 
         system_content = SYSTEM_PROMPT.format(
             context="\n".join(context_parts),
@@ -218,7 +293,6 @@ class FinancialAgent:
             memory=rag_memory or "No relevant past memory."
         )
 
-        # ── Build messages ─────────────────────────────────────
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system_content}
         ]
@@ -228,7 +302,6 @@ class FinancialAgent:
                 messages.append({"role": role, "content": h["content"]})  # type: ignore[arg-type]
         messages.append({"role": "user", "content": user_message})
 
-        # ── Stage 3: Main 70b LLM call ────────────────────────
         has_strong_context = bool(final_doc_context and doc_chunks_used >= 2)
         skip_tools = has_strong_context and query_type in ("document", "factual")
 
@@ -251,7 +324,6 @@ class FinancialAgent:
 
         msg = response.choices[0].message
 
-        # ── Tool execution ─────────────────────────────────────
         if msg.tool_calls:
             tool_results = await self._execute_tools(msg.tool_calls, user_id, user_profile)
 
@@ -286,7 +358,6 @@ class FinancialAgent:
         else:
             answer = msg.content or "I couldn't generate a response."
 
-        # ── Save to DB (embedding generated inside save_message) ──
         await save_message(self.db, user_id, "user", user_message)
         await save_message(self.db, user_id, "assistant", answer)
 

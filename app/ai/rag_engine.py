@@ -1,8 +1,5 @@
 """
 Vectorless RAG Engine — BM25 + PostgreSQL Full-Text Search
-No embeddings. No OpenAI calls. No rate limits.
-Pure keyword-based retrieval tuned for financial data accuracy.
-Outputs scored chunks ready for LLM reranking.
 """
 import re
 import math
@@ -12,9 +9,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-# ──────────────────────────────────────────────
-#  Financial domain vocabulary
-# ──────────────────────────────────────────────
 FINANCIAL_STOP_WORDS = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
@@ -40,18 +34,40 @@ FINANCIAL_PRESERVE = {
     "arpu", "stores", "cities", "utilisation", "crude", "refinery", "telecom"
 }
 
+# ── Bug Fix: PostgreSQL ts_query unsafe characters ─────────────────
+_TS_UNSAFE = re.compile(r"[&|!():*?'\"\\/\-\+\<\>\~\^\{\}\[\]]")
+
+
+def sanitize_ts_token(token: str) -> str:
+    """
+    Remove all characters that are invalid in PostgreSQL tsquery.
+    Returns empty string if nothing valid remains.
+    """
+    cleaned = _TS_UNSAFE.sub("", token).strip()
+    # Must have alphabetic chars and be >= 2 chars
+    if len(cleaned) < 2 or not any(c.isalpha() for c in cleaned):
+        return ""
+    # Pure numbers are meaningless in FTS
+    if cleaned.isdigit():
+        return ""
+    return cleaned
+
+
+def build_safe_ts_query(tokens: list[str]) -> str:
+    """
+    Build a safe PostgreSQL OR-joined ts_query from a list of tokens.
+    Sanitizes every token — never crashes with special chars like & ? ! etc.
+    """
+    safe = [sanitize_ts_token(t) for t in tokens]
+    safe = [t for t in safe if t]  # Remove empties
+    if not safe:
+        return ""
+    return " | ".join(safe[:8])
+
 
 def tokenize_financial(text_input: str) -> list[str]:
-    """
-    Tokenize with financial domain awareness.
-    Keeps ticker symbols, numbers with units, financial terms.
-    """
     text_lower = text_input.lower()
-
-    # Keep ticker-like uppercase words (AAPL, TSLA, RIL, etc.)
     tickers = re.findall(r'\b[A-Z]{2,6}\b', text_input)
-
-    # Tokenize numbers with units as single token (e.g. 9,01,012 → 901012)
     tokens = re.findall(r'\b[\w]+\b', text_lower)
 
     filtered = []
@@ -61,7 +77,6 @@ def tokenize_financial(text_input: str) -> list[str]:
         elif token not in FINANCIAL_STOP_WORDS and len(token) > 2:
             filtered.append(token)
 
-    # Add tickers back
     for ticker in tickers:
         t_lower = ticker.lower()
         if t_lower not in filtered:
@@ -79,10 +94,6 @@ def bm25_score(
     k1: float = 1.5,
     b: float = 0.75
 ) -> float:
-    """
-    BM25 scoring with k1=1.5, b=0.75 (Okapi BM25 standard params).
-    Optimal for financial documents with varied length sections.
-    """
     doc_len = len(doc_tokens)
     doc_token_count = Counter(doc_tokens)
     score = 0.0
@@ -93,15 +104,10 @@ def bm25_score(
 
         tf = doc_token_count[token]
         df = doc_freq.get(token, 1)
-
-        # IDF
         idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
-
-        # TF with length normalization
         tf_norm = (tf * (k1 + 1)) / (
             tf + k1 * (1 - b + b * doc_len / max(avg_doc_len, 1))
         )
-
         score += idf * tf_norm
 
     return score
@@ -112,15 +118,9 @@ def chunk_document(
     chunk_size: int = 400,
     overlap: int = 80
 ) -> list[dict]:
-    """
-    Split document into overlapping chunks.
-    Splits at natural financial section boundaries when possible.
-    Returns chunks with pre-computed BM25 tokens.
-    """
     if not content:
         return []
 
-    # Split at natural financial section headers
     section_splits = re.split(
         r'\n(?=(?:Revenue|Profit|EBITDA|Risk|Segment|Business|Financial|'
         r'Key|Note|Outlook|Balance|Income|Cash|Capital|Debt|Equity|'
@@ -149,7 +149,7 @@ def chunk_document(
                     "text": chunk_text,
                     "tokens": tokens,
                     "start_word": i,
-                    "bm25_score": 0.0  # filled in during retrieval
+                    "bm25_score": 0.0
                 })
                 chunk_id += 1
 
@@ -159,11 +159,6 @@ def chunk_document(
 
 
 class VectorlessRAG:
-    """
-    BM25 retrieval engine — no vectors, no API calls.
-    Outputs candidate chunks for downstream LLM reranking.
-    """
-
     def __init__(self, db: AsyncSession):
         self.db = db
 
@@ -171,22 +166,16 @@ class VectorlessRAG:
         self,
         query: str,
         document_content: str,
-        top_k: int = 15,          # Fetch more — reranker will trim to 5
+        top_k: int = 15,
         filename: str = ""
     ) -> dict:
-        """
-        BM25 retrieval — returns top_k candidate chunks with bm25_score.
-        Deliberately over-fetches (15) for reranker to work with.
-        """
         if not document_content or not query:
             return {"chunks": [], "context": "", "query_tokens": []}
 
-        # Tokenize query
         query_tokens = tokenize_financial(query)
         if not query_tokens:
             query_tokens = [w.lower() for w in query.split() if len(w) > 2]
 
-        # Chunk document
         chunks = chunk_document(document_content)
         if not chunks:
             return {
@@ -195,7 +184,6 @@ class VectorlessRAG:
                 "query_tokens": query_tokens
             }
 
-        # Build IDF table
         doc_freq: dict[str, int] = {}
         for chunk in chunks:
             for token in set(chunk["tokens"]):
@@ -204,7 +192,6 @@ class VectorlessRAG:
         total_docs = len(chunks)
         avg_doc_len = sum(len(c["tokens"]) for c in chunks) / max(total_docs, 1)
 
-        # Score each chunk
         for chunk in chunks:
             score = bm25_score(
                 query_tokens=query_tokens,
@@ -214,7 +201,6 @@ class VectorlessRAG:
                 avg_doc_len=avg_doc_len
             )
 
-            # Domain boost: data-rich chunks for financial metric queries
             has_numbers = bool(re.search(r'\d+[,.]?\d*', chunk["text"]))
             is_data_query = any(t in query_tokens for t in [
                 "revenue", "profit", "ebitda", "margin", "growth", "debt",
@@ -224,10 +210,8 @@ class VectorlessRAG:
             if has_numbers and is_data_query:
                 score *= 1.35
 
-            # Boost: exact phrase match in chunk
             query_lower = query.lower()
             chunk_lower = chunk["text"].lower()
-            # Check if 2+ consecutive query words appear together
             query_words = query_lower.split()
             for j in range(len(query_words) - 1):
                 phrase = query_words[j] + " " + query_words[j + 1]
@@ -237,11 +221,9 @@ class VectorlessRAG:
 
             chunk["bm25_score"] = round(score, 4)
 
-        # Sort and return top candidates
         sorted_chunks = sorted(chunks, key=lambda c: c["bm25_score"], reverse=True)
         candidates = [c for c in sorted_chunks[:top_k] if c["bm25_score"] > 0]
 
-        # Fallback: if nothing matched, return first 5 chunks
         if not candidates:
             candidates = chunks[:min(5, len(chunks))]
             for c in candidates:
@@ -255,16 +237,10 @@ class VectorlessRAG:
         }
 
     def build_context_from_chunks(self, chunks: list[dict]) -> str:
-        """
-        Build final context string from reranked top chunks.
-        Ordered by original document position (maintains readability).
-        """
         if not chunks:
             return ""
 
-        # Sort by original position for coherent reading
         ordered = sorted(chunks, key=lambda c: c.get("id", 0))
-
         parts = []
         for i, chunk in enumerate(ordered):
             score_info = ""
@@ -274,7 +250,6 @@ class VectorlessRAG:
 
         return "\n\n".join(parts)
 
-    # ── Kept for backward compat with agent.py direct calls ──
     def retrieve_from_document(
         self,
         query: str,
@@ -282,10 +257,6 @@ class VectorlessRAG:
         top_k: int = 5,
         filename: str = ""
     ) -> dict:
-        """
-        Simple BM25-only retrieval (no reranking).
-        Used as fallback or for non-document queries.
-        """
         result = self.retrieve_candidates(query, document_content, top_k=top_k, filename=filename)
         chunks = result["chunks"][:top_k]
         context = self.build_context_from_chunks(chunks)
@@ -301,12 +272,8 @@ class VectorlessRAG:
         self,
         user_id: int,
         query: str,
-        top_k: int = 8          # Over-fetch for memory reranker
+        top_k: int = 8
     ) -> list[str]:
-        """
-        BM25 over stored conversations via PostgreSQL FTS.
-        Returns candidates for reranking.
-        """
         if not query:
             return []
 
@@ -315,44 +282,47 @@ class VectorlessRAG:
             return []
 
         try:
-            # PostgreSQL FTS first pass
-            ts_query = " | ".join(query_tokens[:8])
+            # ✅ Bug Fix: Use sanitized ts_query — no more crashes on & ? ! etc.
+            ts_query = build_safe_ts_query(query_tokens)
 
-            result = await self.db.execute(
-                text("""
-                    SELECT content,
-                           ts_rank(to_tsvector('english', content),
-                                   to_tsquery('english', :tsquery)) AS rank
-                    FROM conversations
-                    WHERE user_id = :user_id
-                      AND role = 'user'
-                      AND to_tsvector('english', content) @@ to_tsquery('english', :tsquery)
-                    ORDER BY rank DESC
-                    LIMIT :limit
-                """),
-                {"user_id": user_id, "tsquery": ts_query, "limit": top_k * 2}
-            )
-            rows = result.fetchall()
-
-            if not rows:
-                # ILIKE fallback
-                like_pattern = f"%{query_tokens[0]}%" if query_tokens else "%"
-                result2 = await self.db.execute(
+            if ts_query:
+                result = await self.db.execute(
                     text("""
-                        SELECT content FROM conversations
-                        WHERE user_id = :user_id AND role = 'user'
-                          AND content ILIKE :pattern
-                        ORDER BY created_at DESC
+                        SELECT content,
+                               ts_rank(to_tsvector('english', content),
+                                       to_tsquery('english', :tsquery)) AS rank
+                        FROM conversations
+                        WHERE user_id = :user_id
+                          AND role = 'user'
+                          AND to_tsvector('english', content) @@ to_tsquery('english', :tsquery)
+                        ORDER BY rank DESC
                         LIMIT :limit
                     """),
-                    {"user_id": user_id, "pattern": like_pattern, "limit": top_k}
+                    {"user_id": user_id, "tsquery": ts_query, "limit": top_k * 2}
                 )
-                rows = result2.fetchall()
+                rows = result.fetchall()
+            else:
+                rows = []
+
+            if not rows:
+                # ILIKE fallback — always safe, no special chars
+                safe_keyword = re.sub(r'[%_\\]', '', query_tokens[0]) if query_tokens else ""
+                if safe_keyword:
+                    result2 = await self.db.execute(
+                        text("""
+                            SELECT content FROM conversations
+                            WHERE user_id = :user_id AND role = 'user'
+                              AND content ILIKE :pattern
+                            ORDER BY created_at DESC
+                            LIMIT :limit
+                        """),
+                        {"user_id": user_id, "pattern": f"%{safe_keyword}%", "limit": top_k}
+                    )
+                    rows = result2.fetchall()
 
             if not rows:
                 return []
 
-            # BM25 re-rank candidates
             candidates = [{"text": row[0], "tokens": tokenize_financial(row[0])} for row in rows]
             doc_freq: dict[str, int] = {}
             for c in candidates:
@@ -375,7 +345,10 @@ class VectorlessRAG:
             scored.sort(key=lambda x: x[0], reverse=True)
             return [t for _, t in scored[:top_k]]
 
-        except Exception:
+        except Exception as e:
+            # Log but never crash — return empty
+            import logging
+            logging.getLogger("finbot.rag").warning(f"FTS query failed: {e}")
             return []
 
     async def retrieve_from_memory_db(
@@ -384,10 +357,6 @@ class VectorlessRAG:
         query: str,
         top_k: int = 4
     ) -> str:
-        """
-        BM25 memory retrieval → formatted string for system prompt.
-        (Reranking of memories is done in agent.py)
-        """
         results = await self.retrieve_from_conversations(user_id, query, top_k=top_k * 2)
         if not results:
             return ""
@@ -398,15 +367,7 @@ class VectorlessRAG:
         return "\n".join(lines)
 
 
-# ──────────────────────────────────────────────
-#  PostgreSQL GIN Index Setup
-# ──────────────────────────────────────────────
-
 async def setup_fts_indexes(db: AsyncSession) -> None:
-    """
-    Create GIN indexes for fast full-text search.
-    Idempotent — safe to call on every startup.
-    """
     try:
         await db.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_conversations_fts
