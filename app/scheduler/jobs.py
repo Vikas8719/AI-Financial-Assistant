@@ -164,7 +164,7 @@ async def _gather_market_data(finnhub_svc, yahoo_svc, watchlist: list) -> dict:
 
 async def _generate_brief(profile: dict, market_bundle: dict, groq_client) -> str:
     """
-    Generate personalized morning brief using llama-3.3-70b.
+    Generate personalized morning brief using openai/gpt-oss-120b.
     Temperature=0.45 (creative) — fluent narrative, not robotic.
     """
     from app.ai.prompts import MORNING_BRIEF_PROMPT

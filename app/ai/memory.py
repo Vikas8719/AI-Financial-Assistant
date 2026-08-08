@@ -1,7 +1,7 @@
 """
 Hybrid Memory — pgvector (semantic) + BM25 (keyword) + LLM Reranker
 ─────────────────────────────────────────────────────────────────────
-Save:    message → Groq embedding (llama-3.1-8b via Groq) → pgvector
+Save:    message → Groq embedding (openai/gpt-oss-20b) → pgvector
 Retrieve:
   Step 1 → pgvector cosine search   (top-10, semantic)
   Step 2 → BM25 keyword search      (top-10, exact terms)

@@ -5,13 +5,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_stock_price",
-            "description": "Get real-time stock price, change, and basic info for a ticker symbol.",
+            "description": "Get real-time stock price, change, and basic info for a ticker symbol. Use company name or ticker — both work.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol": {
                         "type": "string",
-                        "description": "Stock ticker symbol e.g. AAPL, TSLA, RELIANCE.NS",
+                        "description": "Stock ticker or company name e.g. AAPL, TSLA, Tesla, Microsoft, RELIANCE.NS",
                     }
                 },
                 "required": ["symbol"],
@@ -26,7 +26,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "Stock ticker symbol"},
+                    "symbol": {"type": "string", "description": "Stock ticker or company name"},
                     "days": {
                         "type": "integer",
                         "description": "Number of days back to fetch news (default 7)",
@@ -41,11 +41,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_company_fundamentals",
-            "description": "Get company financials: revenue, earnings, P/E ratio, market cap, profit margins.",
+            "description": "Get company financials: revenue, earnings, P/E ratio, market cap, profit margins. Use ticker or company name.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "Stock ticker symbol"}
+                    "symbol": {"type": "string", "description": "Stock ticker or company name e.g. MSFT, Google, Apple"}
                 },
                 "required": ["symbol"],
             },
@@ -77,7 +77,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for latest financial news, company information, or market events.",
+            "description": "Search the web for latest financial news, company information, or market events. Use when other tools fail or for very recent news.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -116,17 +116,25 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "compare_companies",
-            "description": "Compare two companies side by side on key financial metrics.",
+            "description": (
+                "Compare two or more companies side by side on key financial metrics: "
+                "revenue, market cap, P/E, margins, growth, debt etc. "
+                "ALWAYS use this for queries like 'compare Tesla and Google', "
+                "'Tesla vs Microsoft', 'which is better AAPL or MSFT'. "
+                "Pass company names OR tickers — both work. "
+                "Has automatic fallback: Yahoo Finance → Finnhub → Web Search, "
+                "so it NEVER fails even if one data source is unavailable."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "symbol1": {
                         "type": "string",
-                        "description": "First company ticker",
+                        "description": "First company name or ticker e.g. 'Tesla' or 'TSLA'",
                     },
                     "symbol2": {
                         "type": "string",
-                        "description": "Second company ticker",
+                        "description": "Second company name or ticker e.g. 'Google' or 'GOOGL'",
                     },
                 },
                 "required": ["symbol1", "symbol2"],
@@ -143,7 +151,7 @@ TOOLS = [
                 "properties": {
                     "document_id": {
                         "type": "integer",
-                        "description": "Optional document ID. Do NOT pass this unless user specifies a document ID. Omit it to use the most recently uploaded document automatically.",
+                        "description": "Optional document ID. Omit to use the most recently uploaded document.",
                     },
                     "question": {
                         "type": "string",

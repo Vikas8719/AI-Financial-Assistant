@@ -1,6 +1,6 @@
 """
-Message router — onboarding flow + AI agent dispatch.
-Auto-injects latest uploaded document context into every AI call.
+Message router — onboarding flow + AI agent dispatch + research intercept.
+Research queries bypass normal agent → go to dedicated research pipeline.
 """
 import logging
 import re
@@ -20,7 +20,6 @@ STEP_KEY = "onboarding_step"
 
 
 async def _get_latest_document_context(db: AsyncSession, user_id: int) -> Optional[str]:
-    """Fetch the most recently uploaded document's content for context injection."""
     from app.database import Document
     result = await db.execute(
         select(Document)
@@ -31,7 +30,6 @@ async def _get_latest_document_context(db: AsyncSession, user_id: int) -> Option
     doc = result.scalar_one_or_none()
     if not doc or not doc.content or len(doc.content.strip()) < 50:
         return None
-
     context_parts = [f"📄 Uploaded Document: {doc.filename}"]
     if doc.summary:
         context_parts.append(f"Summary: {doc.summary}")
@@ -47,23 +45,43 @@ async def route_text_message(db: AsyncSession, user, text: str) -> str:
         auth_url = f"{settings.WEBHOOK_URL.rstrip('/')}/auth/google?user_id={user.id}"
         return (
             f"🔗 Connect your Google account to unlock Gmail & Calendar features:\n\n"
-            f"{auth_url}\n\n"
-            "After connecting, come back and keep chatting!"
+            f"{auth_url}\n\nAfter connecting, come back and keep chatting!"
         )
 
     if not user.onboarded:
         return await _run_onboarding(db, user, text)
 
-    profile = await get_user_profile_dict(db, user.id)
+    profile          = await get_user_profile_dict(db, user.id)
     document_context = await _get_latest_document_context(db, user.id)
 
+    # ── Research intercept ─────────────────────────────────────
+    # Check BEFORE sending to agent — research needs special pipeline
+    from app.services.research_service import is_research_query, run_research
+    is_research, company_raw = is_research_query(text)
+
+    if is_research and company_raw:
+        logger.info(f"🔬 Research query detected: '{company_raw}'")
+        try:
+            return await run_research(
+                company_raw=company_raw,
+                user_profile=profile,
+                db=db
+            )
+        except Exception as e:
+            logger.error(f"Research pipeline failed: {e}")
+            # Fallback to normal agent with research hint
+            text = f"Give me a detailed analysis of {company_raw} including financials, recent news, risks and outlook."
+
+    # ── Normal agent ───────────────────────────────────────────
     agent = FinancialAgent(db)
-    return await agent.process_message(user.id, text, profile, document_context=document_context)
+    return await agent.process_message(
+        user.id, text, profile, document_context=document_context
+    )
 
 
 async def _run_onboarding(db: AsyncSession, user, text: str) -> str:
     prefs = dict(user.preferences or {})
-    step = int(prefs.get(STEP_KEY, 0))
+    step  = int(prefs.get(STEP_KEY, 0))
 
     if step == 0:
         prefs[STEP_KEY] = 1
@@ -104,9 +122,8 @@ async def _run_onboarding(db: AsyncSession, user, text: str) -> str:
         )
 
     if step == 4:
-        # Parse both briefing time and timezone from same message
         briefing_time = None if _is_skip(text) else _parse_time(text)
-        timezone = _parse_timezone(text)
+        timezone      = _parse_timezone(text)
         prefs[STEP_KEY] = 99
         await update_user(
             db, user.id,
@@ -116,7 +133,7 @@ async def _run_onboarding(db: AsyncSession, user, text: str) -> str:
             preferences=prefs,
         )
         from app.models.user_repo import get_user
-        user = await get_user(db, user.id)
+        user         = await get_user(db, user.id)
         watchlist_val = list(user.watchlist or [])
         interests_val = list(user.interests or [])
         return ONBOARDING_COMPLETE.format(
@@ -160,7 +177,6 @@ def _parse_time(text: str) -> Optional[str]:
     match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
     if match:
         return f"{int(match.group(1)):02d}:{match.group(2)}"
-    # Handle "8 AM", "8AM"
     match = re.search(r"\b(\d{1,2})\s*(am|pm)\b", text.lower())
     if match:
         hour = int(match.group(1))
@@ -173,47 +189,28 @@ def _parse_time(text: str) -> Optional[str]:
 
 
 def _parse_timezone(text: str) -> str:
-    """Extract timezone from user message."""
     text_lower = text.lower()
-
-    # Common shorthand mappings
     tz_map = {
-        "ist": "Asia/Kolkata",
-        "india": "Asia/Kolkata",
-        "kolkata": "Asia/Kolkata",
-        "mumbai": "Asia/Kolkata",
-        "est": "America/New_York",
-        "edt": "America/New_York",
+        "ist": "Asia/Kolkata",       "india": "Asia/Kolkata",
+        "kolkata": "Asia/Kolkata",   "mumbai": "Asia/Kolkata",
+        "est": "America/New_York",   "edt": "America/New_York",
         "new york": "America/New_York",
-        "pst": "America/Los_Angeles",
-        "pdt": "America/Los_Angeles",
-        "gmt": "Europe/London",
-        "utc": "UTC",
-        "cst": "America/Chicago",
-        "mst": "America/Denver",
-        "dubai": "Asia/Dubai",
-        "uae": "Asia/Dubai",
-        "singapore": "Asia/Singapore",
-        "sgt": "Asia/Singapore",
-        "jst": "Asia/Tokyo",
-        "japan": "Asia/Tokyo",
-        "london": "Europe/London",
-        "paris": "Europe/Paris",
-        "sydney": "Australia/Sydney",
-        "aest": "Australia/Sydney",
+        "pst": "America/Los_Angeles","pdt": "America/Los_Angeles",
+        "gmt": "Europe/London",      "utc": "UTC",
+        "cst": "America/Chicago",    "mst": "America/Denver",
+        "dubai": "Asia/Dubai",       "uae": "Asia/Dubai",
+        "singapore": "Asia/Singapore","sgt": "Asia/Singapore",
+        "jst": "Asia/Tokyo",         "japan": "Asia/Tokyo",
+        "london": "Europe/London",   "paris": "Europe/Paris",
+        "sydney": "Australia/Sydney","aest": "Australia/Sydney",
     }
-
     for key, tz in tz_map.items():
         if key in text_lower:
             return tz
-
-    # Try full timezone name like "Asia/Kolkata"
     import pytz
     tz_match = re.search(r"[A-Z][a-z]+/[A-Z][a-z_]+", text)
     if tz_match:
         tz_str = tz_match.group(0)
         if tz_str in pytz.all_timezones:
             return tz_str
-
-    # Default to IST for Indian users
     return "Asia/Kolkata"
