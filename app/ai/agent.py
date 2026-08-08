@@ -32,10 +32,9 @@ search      = WebSearchService()
 
 
 # ──────────────────────────────────────────────────────────────
-#  Query Classifier — Fixed
+#  Query Classifier
 # ──────────────────────────────────────────────────────────────
 
-# Short conversational messages that should NEVER be analytical
 CONVERSATIONAL_OVERRIDES = {
     "hi", "hello", "hey", "hii", "helo", "hola",
     "how are you", "how r u", "how are you doing",
@@ -48,100 +47,36 @@ CONVERSATIONAL_OVERRIDES = {
 
 
 def _is_conversational_override(q: str) -> bool:
-    """Check if query is purely conversational — before any pattern matching."""
     q_stripped = q.strip().lower().rstrip("!?.,:;")
-
-    # Direct match
     if q_stripped in CONVERSATIONAL_OVERRIDES:
         return True
-
-    # Short greeting patterns (under 5 words)
     words = q_stripped.split()
     if len(words) <= 4:
         greeting_words = {"hi", "hello", "hey", "hii", "helo", "greetings", "howdy"}
         if words[0] in greeting_words:
             return True
-        # "how are you *" with <= 4 words
         if len(words) >= 3 and words[0] == "how" and words[1] == "are":
             return True
-
     return False
 
 
-def _sanitize_ts_query(tokens: list[str]) -> str:
-    """
-    ✅ FIX for Bug 2: Sanitize tokens before building PostgreSQL ts_query.
-
-    Removes/escapes characters that crash PostgreSQL FTS:
-    - & (AND operator)
-    - | (OR operator)
-    - ! (NOT operator)
-    - ( ) (grouping)
-    - : (lexeme weight)
-    - * (prefix match — only valid at end)
-    - ? (not valid in tsquery)
-    - ' (quote)
-    - " (double quote)
-    - Numbers-only tokens (no lexeme value)
-    - Empty strings
-
-    Returns a safe OR-joined ts_query string.
-    """
-    INVALID_CHARS = re.compile(r"[&|!():*?'\"\\/]")
-    safe_tokens = []
-
-    for token in tokens:
-        # Strip invalid chars
-        cleaned = INVALID_CHARS.sub("", token).strip()
-
-        # Skip empty, numbers-only, or too-short tokens
-        if not cleaned or len(cleaned) < 2:
-            continue
-        if cleaned.isdigit():
-            continue
-
-        # Must have at least one alphabetic character
-        if not any(c.isalpha() for c in cleaned):
-            continue
-
-        safe_tokens.append(cleaned)
-
-    if not safe_tokens:
-        return ""
-
-    # Use OR (|) joining — more permissive, better recall
-    return " | ".join(safe_tokens[:8])
-
-
 def classify_query(query: str) -> str:
-    """
-    ✅ FIX for Bug 1: Check conversational overrides FIRST.
-
-    Problem was: 'how' in analytical patterns caused
-    'Hello how are you' → 'analytical' (WRONG)
-
-    Fix: short greetings and casual phrases are intercepted
-    before any regex pattern matching runs.
-    """
     q = query.lower().strip()
 
-    # ── STEP 1: Conversational override (must come FIRST) ──────
     if _is_conversational_override(q):
         return "conversational"
 
-    # ── STEP 2: Factual — specific data points ──────────────────
     factual_patterns = [
         r'\bprice\b', r'\bstock\b', r'\bquote\b', r'\beps\b', r'\bpe\b',
         r'\bmarket cap\b', r'\bdividend\b', r'\bearning[s]?\b', r'\brevenue\b',
         r'\bprofit\b', r'\bebitda\b', r'\bdebt\b', r'\bshare price\b',
         r'\b52.week\b', r'\bvolume\b', r'\bcrore\b', r'\bbillion\b',
         r'\bmillion\b', r'\byield\b', r'\bsubscriber[s]?\b', r'\barpu\b',
-        r'\beps\b', r'\broe\b', r'\broa\b', r'\bcash\b', r'\bmargin\b',
+        r'\broe\b', r'\broa\b', r'\bcash\b', r'\bmargin\b',
     ]
     if any(re.search(p, q) for p in factual_patterns):
         return "factual"
 
-    # ── STEP 3: Document — report/filing queries ─────────────────
     document_patterns = [
         r'\bdocument\b', r'\breport\b', r'\bfiling\b', r'\b10.?k\b',
         r'\b10.?q\b', r'\bannual\b', r'\bpdf\b', r'\bpage\b',
@@ -151,9 +86,6 @@ def classify_query(query: str) -> str:
     if any(re.search(p, q) for p in document_patterns):
         return "document"
 
-    # ── STEP 4: Analytical — compare/analyze/explain ─────────────
-    # NOTE: 'how' removed — causes false positives on "how are you"
-    # Use more specific multi-word patterns for how-based queries
     analytical_patterns = [
         r'\banalyze\b', r'\banalysis\b', r'\bcompare\b', r'\bvs\b',
         r'\bversus\b', r'\bwhy\b', r'\bhow (does|did|do|is|was|will|can|much|many)\b',
@@ -166,7 +98,6 @@ def classify_query(query: str) -> str:
     if any(re.search(p, q) for p in analytical_patterns):
         return "analytical"
 
-    # ── STEP 5: Creative — summaries, news briefs ────────────────
     creative_patterns = [
         r'\bsummariz\b', r'\bbrief\b', r'\boverview\b', r'\bdigest\b',
         r'\btop news\b', r'\bmorning\b', r'\bwhat.s happening\b',
@@ -278,12 +209,10 @@ class FinancialAgent:
         user_profile_str = json.dumps(user_profile, ensure_ascii=False)
 
         context_parts = [f"Current time: {now}"]
-
         if final_doc_context:
             context_parts.append(
                 f"\n📄 DOCUMENT EXCERPTS ({doc_chunks_used} sections):\n\n{final_doc_context[:4500]}"
             )
-
         if rag_memory:
             context_parts.append(f"\n🧠 RELEVANT PAST CONTEXT:\n{rag_memory}")
 
@@ -305,6 +234,7 @@ class FinancialAgent:
         has_strong_context = bool(final_doc_context and doc_chunks_used >= 2)
         skip_tools = has_strong_context and query_type in ("document", "factual")
 
+        # ── First LLM call ────────────────────────────────────────
         if skip_tools:
             response = await main_client.chat.completions.create(
                 model=MAIN_MODEL,
@@ -327,6 +257,7 @@ class FinancialAgent:
         if msg.tool_calls:
             tool_results = await self._execute_tools(msg.tool_calls, user_id, user_profile)
 
+            # Append assistant tool call turn
             assistant_msg: ChatCompletionMessageParam = {
                 "role": "assistant",
                 "content": msg.content or "",
@@ -348,13 +279,34 @@ class FinancialAgent:
                     "content": json.dumps(result)
                 })
 
-            final_response = await main_client.chat.completions.create(
-                model=MAIN_MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=min(temperature, 0.15)
-            )
-            answer = final_response.choices[0].message.content or "I couldn't generate a response."
+            # ── Second LLM call — MUST use tool_choice="none" ────
+            # Fix: Without tool_choice="none", model tries to call
+            # more tools and Groq returns 400 "tool_use_failed"
+            try:
+                final_response = await main_client.chat.completions.create(
+                    model=MAIN_MODEL,
+                    messages=messages,
+                    tools=TOOLS,          # type: ignore[arg-type]
+                    tool_choice="none",   # ← KEY FIX: force text response only
+                    max_tokens=max_tokens,
+                    temperature=min(temperature, 0.15)
+                )
+                answer = final_response.choices[0].message.content or "I couldn't generate a response."
+            except Exception as e:
+                # Fallback: retry WITHOUT tools entirely
+                import logging
+                logging.getLogger("finbot.agent").warning(f"Second LLM call failed: {e} — retrying without tools")
+                try:
+                    fallback_response = await main_client.chat.completions.create(
+                        model=MAIN_MODEL,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=min(temperature, 0.15)
+                    )
+                    answer = fallback_response.choices[0].message.content or "I couldn't generate a response."
+                except Exception as e2:
+                    answer = f"⚠️ Sorry, I encountered an error processing your request. Please try again."
+                    logging.getLogger("finbot.agent").error(f"Fallback also failed: {e2}")
         else:
             answer = msg.content or "I couldn't generate a response."
 
