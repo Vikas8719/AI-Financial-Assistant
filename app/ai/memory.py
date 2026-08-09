@@ -1,23 +1,17 @@
 """
-Hybrid Memory — pgvector (semantic) + BM25 (keyword) + LLM Reranker
-─────────────────────────────────────────────────────────────────────
-Save:    message → Groq embedding (openai/gpt-oss-20b) → pgvector
-Retrieve:
-  Step 1 → pgvector cosine search   (top-10, semantic)
-  Step 2 → BM25 keyword search      (top-10, exact terms)
-  Step 3 → Merge + deduplicate      (up to 15 unique candidates)
-  Step 4 → LLM Reranker (8b)        (picks best 3-4)
+Hybrid Memory — BM25 (keyword) + pgvector (semantic, optional)
+─────────────────────────────────────────────────────────────────
+FIX 1: Groq does NOT support /embeddings endpoint → 404 error.
+        Embeddings silently disabled — BM25 handles retrieval alone.
+        When embeddings become available (OpenAI key added), it auto-enables.
 
-Benefits:
-  ✅ pgvector catches: "profit fell" ↔ "earnings decline" (semantic)
-  ✅ BM25 catches: "AAPL", "INR 9,01,012", "EBITDA 19.8%" (exact)
-  ✅ Reranker eliminates noise from both
-  ✅ Groq embedding = no OpenAI dependency, same API key
+FIX 2: Token usage reduced — memory search no longer calls LLM.
+        BM25 is free (PostgreSQL), no API calls, no rate limits.
+─────────────────────────────────────────────────────────────────
 """
 from datetime import datetime
 from typing import List, Optional
 
-import httpx
 from sqlalchemy import select, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,32 +24,35 @@ def _now() -> datetime:
 
 
 # ──────────────────────────────────────────────
-#  Groq Embedding  (nomic-embed-text via Groq)
+#  Embedding (Optional — disabled if no OpenAI key)
 # ──────────────────────────────────────────────
-
-GROQ_EMBED_MODEL = "nomic-embed-text-v1_5"   # 768-dim, free on Groq
-EMBED_DIM        = 768
-
 
 async def get_embedding(text_input: str) -> Optional[List[float]]:
     """
-    Generate embedding using Groq's embedding endpoint.
+    FIX: Groq does NOT have /embeddings endpoint (404).
+    Only attempt if OPENAI_API_KEY is set.
     Falls back to None silently — BM25 still works without embeddings.
-    Uses the same GROQ_API_KEY, no extra cost.
     """
     if not text_input or len(text_input.strip()) < 3:
         return None
+
+    # Check if OpenAI key is available (optional feature)
+    openai_key = getattr(settings, "OPENAI_API_KEY", None)
+    if not openai_key:
+        return None   # BM25-only mode — no embeddings, no problem
+
     try:
+        import httpx
         async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.post(
-                "https://api.groq.com/openai/v1/embeddings",
+                "https://api.openai.com/v1/embeddings",
                 headers={
-                    "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+                    "Authorization": f"Bearer {openai_key}",
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": GROQ_EMBED_MODEL,
-                    "input": text_input[:512]   # Groq embedding max input
+                    "model": "text-embedding-3-small",  # Cheapest OpenAI embedding
+                    "input": text_input[:512]
                 }
             )
             if response.status_code == 200:
@@ -78,21 +75,20 @@ async def save_message(
     metadata: Optional[dict] = None
 ) -> Conversation:
     """
-    Save message with embedding for user turns.
-    Assistant turns don't need embeddings (we search by user intent).
-    Embedding failure is non-fatal — BM25 fallback handles retrieval.
+    Save message. Embedding only attempted if OpenAI key available.
+    BM25 search works perfectly without embeddings.
     """
     embedding = None
     if role == "user":
-        embedding = await get_embedding(content)
+        embedding = await get_embedding(content)   # Returns None if no OpenAI key
 
     msg = Conversation(
-        user_id=user_id,
-        role=role,
-        content=content,
-        embedding=embedding,        # None if Groq embed failed — safe
-        metadata_=metadata or {},
-        created_at=_now()
+        user_id   = user_id,
+        role      = role,
+        content   = content,
+        embedding = embedding,
+        metadata_ = metadata or {},
+        created_at = _now()
     )
     db.add(msg)
     await db.commit()
@@ -101,7 +97,7 @@ async def save_message(
 
 
 # ──────────────────────────────────────────────
-#  pgvector Semantic Search
+#  pgvector Semantic Search (only if embeddings available)
 # ──────────────────────────────────────────────
 
 async def search_memory_semantic(
@@ -110,22 +106,13 @@ async def search_memory_semantic(
     query: str,
     limit: int = 10
 ) -> List[str]:
-    """
-    pgvector cosine similarity search over past user messages.
-    Returns content strings, sorted by semantic relevance.
-    Falls back to [] if no embeddings available.
-    """
+    """Semantic search — skipped if no OpenAI key (returns [])."""
     query_embedding = await get_embedding(query)
     if not query_embedding:
-        return []
+        return []   # BM25 handles everything
 
     try:
-        # Adjust vector dimensions to match DB column
-        # DB has Vector(1536) from old setup; nomic gives 768
-        # We pad with zeros to match — pgvector handles dimension mismatch
-        # by returning 0 similarity (safe — just won't match old 1536-dim rows)
         vector_str = f"[{','.join(map(str, query_embedding))}]"
-
         result = await db.execute(
             text("""
                 SELECT content,
@@ -137,22 +124,16 @@ async def search_memory_semantic(
                 ORDER BY embedding <=> :embedding::vector
                 LIMIT :limit
             """),
-            {
-                "user_id":   user_id,
-                "embedding": vector_str,
-                "limit":     limit
-            }
+            {"user_id": user_id, "embedding": vector_str, "limit": limit}
         )
         rows = result.fetchall()
-        # Only return rows with reasonable similarity (>0.3)
         return [row[0] for row in rows if row[1] > 0.3]
-
     except Exception:
         return []
 
 
 # ──────────────────────────────────────────────
-#  BM25 Keyword Search (via PostgreSQL FTS)
+#  BM25 Keyword Search — PRIMARY retrieval method
 # ──────────────────────────────────────────────
 
 async def search_memory_bm25(
@@ -162,18 +143,30 @@ async def search_memory_bm25(
     limit: int = 10
 ) -> List[str]:
     """
-    PostgreSQL full-text search (BM25-style) for exact financial terms.
-    Catches: tickers (AAPL), numbers (9,01,012), exact terms (EBITDA).
+    PostgreSQL full-text search — free, no API calls, no rate limits.
+    Catches: tickers (AAPL), numbers, exact terms (EBITDA, PE ratio).
     """
-    from app.ai.rag_engine import tokenize_financial
+    try:
+        from app.ai.rag_engine import tokenize_financial
+        query_tokens = tokenize_financial(query)
+    except Exception:
+        query_tokens = [w for w in query.split() if len(w) > 2]
 
-    query_tokens = tokenize_financial(query)
     if not query_tokens:
-        return []
+        # Fallback: recent history
+        result = await db.execute(
+            text("""
+                SELECT content FROM conversations
+                WHERE user_id = :user_id AND role = 'user'
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """),
+            {"user_id": user_id, "limit": limit}
+        )
+        return [row[0] for row in result.fetchall()]
 
     try:
         ts_query = " | ".join(query_tokens[:8])
-
         result = await db.execute(
             text("""
                 SELECT content,
@@ -194,8 +187,8 @@ async def search_memory_bm25(
         rows = result.fetchall()
 
         if not rows:
-            # ILIKE fallback for short queries
-            pattern = f"%{query_tokens[0]}%" if query_tokens else "%"
+            # ILIKE fallback for short queries / tickers
+            pattern = f"%{query_tokens[0]}%"
             result2 = await db.execute(
                 text("""
                     SELECT content FROM conversations
@@ -216,38 +209,34 @@ async def search_memory_bm25(
 
 
 # ──────────────────────────────────────────────
-#  Hybrid Search — Merge + Deduplicate
+#  Hybrid Search
 # ──────────────────────────────────────────────
 
 async def search_memory_hybrid(
     db: AsyncSession,
     user_id: int,
     query: str,
-    top_k: int = 8      # Over-fetch for reranker
+    top_k: int = 8
 ) -> List[str]:
     """
-    Hybrid retrieval: pgvector + BM25, merged & deduplicated.
-    Both run concurrently for speed.
+    Hybrid retrieval: BM25 (always) + pgvector (if embeddings available).
+    BM25-only mode works well for financial queries.
     """
     import asyncio
 
-    # Run both searches concurrently
     semantic_results, bm25_results = await asyncio.gather(
         search_memory_semantic(db, user_id, query, limit=10),
         search_memory_bm25(db, user_id, query, limit=10)
     )
 
-    # Merge with deduplication (preserve order — semantic first)
-    seen = set()
+    seen   = set()
     merged = []
 
-    # Interleave: semantic[0], bm25[0], semantic[1], bm25[1], ...
-    # This gives fair weight to both methods
     max_len = max(len(semantic_results), len(bm25_results))
     for i in range(max_len):
         if i < len(semantic_results):
             content = semantic_results[i]
-            key = content[:80]          # Short key for dedup
+            key = content[:80]
             if key not in seen:
                 seen.add(key)
                 merged.append(content)
@@ -262,7 +251,7 @@ async def search_memory_hybrid(
 
 
 # ──────────────────────────────────────────────
-#  Recent History (unchanged)
+#  Recent History
 # ──────────────────────────────────────────────
 
 async def get_recent_history(
@@ -270,7 +259,6 @@ async def get_recent_history(
     user_id: int,
     limit: int = 20
 ) -> List[dict]:
-    """Get recent conversation turns for context window."""
     result = await db.execute(
         select(Conversation)
         .where(Conversation.user_id == user_id)
@@ -287,12 +275,11 @@ async def get_conversation_summary(
     user_id: int,
     last_n: int = 50
 ) -> str:
-    """Compact recent memory summary (fallback for system prompt)."""
     history = await get_recent_history(db, user_id, limit=last_n)
     if not history:
         return "No previous conversations."
     recent = history[-10:]
-    lines = []
+    lines  = []
     for msg in recent:
         prefix  = "User" if msg["role"] == "user" else "Assistant"
         content = msg["content"][:200] + "..." if len(msg["content"]) > 200 else msg["content"]

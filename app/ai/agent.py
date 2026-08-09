@@ -1,23 +1,21 @@
 """
-Main AI Agent — 4-Stage Pipeline
-─────────────────────────────────────────────────────────────────────
-Stage 1 │ Document: BM25 candidates (15)                    │ 0ms
-Stage 2 │ Memory: pgvector (semantic) + BM25 (keyword)      │ ~0.5s concurrent
-Stage 3 │ openai/gpt-oss-20b reranker → doc top-5         │ ~1s
-         │                               → memory top-3     │ (same call)
-Stage 4 │ openai/gpt-oss-120b → final answer            │ ~2s
-─────────────────────────────────────────────────────────────────────
-Compare fix:
-  compare_companies → smart_compare (3-layer fallback)
-  Yahoo fail → Finnhub → Web search + BM25 + reranker → 70b answer
-  User kabhi "encountered an error" nahi dekhega
+Main AI Agent — Token-Optimized + Rate Limit Resilient
+─────────────────────────────────────────────────────────────────
+FIX 1: Groq embeddings removed (404 error) — memory.py handles this
+FIX 2: Token limits reduced to save TPD quota:
+        factual: 300 (was 512)
+        analytical: 1200 (was 1800)
+        max history: 6 turns (was 10)
+FIX 3: Rate limit (429) error → user gets friendly message, not crash
+FIX 4: Reranker model corrected — uses same GROQ_API_KEY
+─────────────────────────────────────────────────────────────────
 """
 import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from groq import AsyncGroq
+from groq import AsyncGroq, RateLimitError
 from groq.types.chat import ChatCompletionMessageParam
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,20 +98,21 @@ def classify_query(query: str) -> str:
     return "conversational"
 
 
+# FIX 2: Reduced token limits to save TPD quota
 TEMPERATURE_MAP = {
     "factual":        0.0,
     "document":       0.1,
     "analytical":     0.2,
-    "creative":       0.45,
+    "creative":       0.4,
     "conversational": 0.4,
 }
 
 MAX_TOKENS_MAP = {
-    "factual":        512,
-    "document":       1200,
-    "analytical":     1800,   # Compare needs more tokens
-    "creative":       900,
-    "conversational": 450,
+    "factual":        300,   # was 512  — saves 200 tokens/request
+    "document":       900,   # was 1200
+    "analytical":     1200,  # was 1800 — saves 600 tokens
+    "creative":       600,   # was 900
+    "conversational": 350,   # was 450
 }
 
 
@@ -122,31 +121,18 @@ MAX_TOKENS_MAP = {
 # ──────────────────────────────────────────────────────────────
 
 def _extract_compare_companies(query: str) -> list[str]:
-    """
-    Extract company names/tickers from a compare query.
-    "compare Tesla and Google" → ["Tesla", "Google"]
-    "TSLA vs MSFT vs AAPL"   → ["TSLA", "MSFT", "AAPL"]
-    """
     q = query.lower()
-
-    # Remove compare trigger words
     q = re.sub(
         r'\b(compare|comparison|between|versus|vs\.?|and|or|with|,)\b',
         ' ', q, flags=re.IGNORECASE
     )
-
-    # Split on whitespace, filter short words
     tokens = [t.strip() for t in q.split() if len(t.strip()) > 1]
-
-    # Filter out filler words
     skip = {
         "the", "a", "an", "to", "for", "of", "me", "please", "show",
         "give", "tell", "their", "financials", "metrics", "stocks",
         "companies", "company", "stock", "price", "data"
     }
     candidates = [t for t in tokens if t not in skip]
-
-    # Return up to 4 companies
     return candidates[:4] if candidates else []
 
 
@@ -167,12 +153,12 @@ class FinancialAgent:
         document_context: Optional[str] = None
     ) -> str:
 
-        # ── Stage 0: Classify query ────────────────────────────
+        # ── Stage 0: Classify ─────────────────────────────────
         query_type  = classify_query(user_message)
         temperature = TEMPERATURE_MAP[query_type]
         max_tokens  = MAX_TOKENS_MAP[query_type]
 
-        # ── Stage 1: BM25 + Hybrid memory (concurrent) ────────
+        # ── Stage 1: Retrieval (concurrent) ───────────────────
         import asyncio
 
         async def _doc_retrieval():
@@ -197,7 +183,7 @@ class FinancialAgent:
             _memory_retrieval()
         )
 
-        # ── Stage 2a: Rerank document chunks (8b) ─────────────
+        # ── Stage 2a: Rerank doc chunks ────────────────────────
         final_doc_context = ""
         doc_chunks_used   = 0
 
@@ -217,7 +203,7 @@ class FinancialAgent:
                 temperature = TEMPERATURE_MAP["document"]
                 max_tokens  = MAX_TOKENS_MAP["document"]
 
-        # ── Stage 2b: Rerank hybrid memories (8b) ─────────────
+        # ── Stage 2b: Rerank memories ─────────────────────────
         rag_memory = ""
         if hybrid_memories:
             relevant_memories = await rerank_memory(
@@ -228,62 +214,74 @@ class FinancialAgent:
             if relevant_memories:
                 lines = []
                 for i, mem in enumerate(relevant_memories, 1):
-                    snippet = mem[:250] + "..." if len(mem) > 250 else mem
+                    snippet = mem[:200] + "..." if len(mem) > 200 else mem  # was 250
                     lines.append(f"[Memory {i}]: {snippet}")
                 rag_memory = "\n".join(lines)
 
         # ── Build system prompt ────────────────────────────────
-        history = await get_recent_history(self.db, user_id, limit=10)
+        # FIX 2: Only last 6 turns (was 10) — saves ~400 tokens
+        history = await get_recent_history(self.db, user_id, limit=6)
         now     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         user_profile_str = json.dumps(user_profile, ensure_ascii=False)
 
-        context_parts = [f"Current time: {now}"]
+        context_parts = [f"Now: {now}"]
         if final_doc_context:
             context_parts.append(
-                f"\n📄 DOCUMENT EXCERPTS — BM25 retrieved, AI reranked "
-                f"({doc_chunks_used} sections):\n\n{final_doc_context[:4500]}"
+                f"\n📄 DOCUMENT ({doc_chunks_used} sections):\n{final_doc_context[:3500]}"  # was 4500
             )
         if rag_memory:
-            context_parts.append(
-                f"\n🧠 RELEVANT PAST CONTEXT — pgvector + BM25 hybrid, AI reranked:\n{rag_memory}"
-            )
+            context_parts.append(f"\n🧠 MEMORY:\n{rag_memory}")
 
         system_content = SYSTEM_PROMPT.format(
-            context="\n".join(context_parts),
-            user_profile=user_profile_str,
-            memory=rag_memory or "No relevant past memory."
+            context      = "\n".join(context_parts),
+            user_profile = user_profile_str,
+            memory       = rag_memory or "None."
         )
 
         # ── Build messages ─────────────────────────────────────
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system_content}
         ]
-        for h in history[-8:]:
+        for h in history[-6:]:  # FIX 2: 6 turns max
             role = h["role"]
             if role in ("user", "assistant", "system"):
-                messages.append({"role": role, "content": h["content"]})  # type: ignore[arg-type]
+                messages.append({"role": role, "content": h["content"]})  # type: ignore
         messages.append({"role": "user", "content": user_message})
 
-        # ── Stage 3: Main 70b LLM call ────────────────────────
+        # ── LLM call with rate limit handling ─────────────────
         has_strong_context = bool(final_doc_context and doc_chunks_used >= 2)
         skip_tools = has_strong_context and query_type in ("document", "factual")
 
-        if skip_tools:
-            response = await main_client.chat.completions.create(
-                model=MAIN_MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature
+        try:
+            if skip_tools:
+                response = await main_client.chat.completions.create(
+                    model       = MAIN_MODEL,
+                    messages    = messages,
+                    max_tokens  = max_tokens,
+                    temperature = temperature
+                )
+            else:
+                response = await main_client.chat.completions.create(
+                    model       = MAIN_MODEL,
+                    messages    = messages,
+                    tools       = TOOLS,       # type: ignore
+                    tool_choice = "auto",
+                    max_tokens  = max_tokens,
+                    temperature = temperature
+                )
+        except RateLimitError as e:
+            # FIX 3: Friendly rate limit message instead of crash
+            err_str = str(e)
+            wait_match = re.search(r'try again in (\d+m\d+s|\d+s)', err_str)
+            wait_time  = wait_match.group(1) if wait_match else "kuch minutes"
+            await save_message(self.db, user_id, "user", user_message)
+            return (
+                f"⏳ Abhi bahut zyada requests aa rahi hain — {wait_time} mein dobara try karein.\n\n"
+                f"_(Daily AI quota temporarily full — thodi der mein wapas aajao!)_"
             )
-        else:
-            response = await main_client.chat.completions.create(
-                model=MAIN_MODEL,
-                messages=messages,
-                tools=TOOLS,  # type: ignore[arg-type]
-                tool_choice="auto",
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
+        except Exception as e:
+            await save_message(self.db, user_id, "user", user_message)
+            return "⚠️ AI response nahi mila. Please dobara try karein."
 
         msg = response.choices[0].message
 
@@ -296,7 +294,7 @@ class FinancialAgent:
             assistant_msg: ChatCompletionMessageParam = {
                 "role": "assistant",
                 "content": msg.content or "",
-                "tool_calls": [  # type: ignore[typeddict-item]
+                "tool_calls": [  # type: ignore
                     {
                         "id": tc.id,
                         "type": "function",
@@ -312,21 +310,26 @@ class FinancialAgent:
 
             for tool_call, result in zip(msg.tool_calls, tool_results):
                 messages.append({
-                    "role": "tool",          # type: ignore[typeddict-item]
+                    "role": "tool",          # type: ignore
                     "tool_call_id": tool_call.id,
                     "content": json.dumps(result, ensure_ascii=False)
                 })
 
-            # Final synthesis — cap temperature after tool data
-            final_response = await main_client.chat.completions.create(
-                model=MAIN_MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=min(temperature, 0.15)
-            )
-            answer = final_response.choices[0].message.content or "I couldn't generate a response."
+            try:
+                final_response = await main_client.chat.completions.create(
+                    model       = MAIN_MODEL,
+                    messages    = messages,
+                    max_tokens  = max_tokens,
+                    temperature = min(temperature, 0.15)
+                )
+                answer = final_response.choices[0].message.content or "Response generate nahi hua."
+            except RateLimitError:
+                # FIX 3: Even tool synthesis can hit rate limit
+                answer = "⏳ AI quota temporarily full. Thodi der mein dobara try karein."
+            except Exception:
+                answer = "⚠️ Response generate nahi hua. Please try again."
         else:
-            answer = msg.content or "I couldn't generate a response."
+            answer = msg.content or "Response generate nahi hua."
 
         # ── Save to DB ─────────────────────────────────────────
         await save_message(self.db, user_id, "user", user_message)
@@ -353,11 +356,10 @@ class FinancialAgent:
             try:
                 result = await self._call_tool(name, args, user_id, original_query)
             except Exception as e:
-                # Never propagate raw errors — return structured fallback
                 result = {
                     "_tool_error": str(e),
                     "_tool": name,
-                    "_note": "Data retrieval encountered an issue. Using available information."
+                    "_note": "Data retrieval failed. Using available information."
                 }
             results.append(result)
         return results
@@ -373,12 +375,10 @@ class FinancialAgent:
         if name == "get_stock_price":
             sym    = resolve_ticker(args.get("symbol", ""))
             result = await finnhub.get_quote(sym)
-            # Fallback if Finnhub fails
             if result.get("error"):
                 result2 = await yahoo.get_fundamentals(sym)
                 if not result2.get("error"):
                     return result2
-                # Web search fallback
                 ws = await search.search(f"{sym} stock price today")
                 return {**result, "_web_fallback": ws.get("answer", ""), "_source": "web"}
             return result
@@ -395,26 +395,20 @@ class FinancialAgent:
             sym    = resolve_ticker(args.get("symbol", ""))
             result = await yahoo.get_fundamentals(sym)
             if result.get("error") or not _fundamentals_ok(result):
-                # Finnhub fallback
                 from app.services.compare_service import _fetch_finnhub
                 result2 = await _fetch_finnhub(sym)
                 if not result2.get("error"):
                     return result2
-                # Web search fallback
                 from app.services.compare_service import _fetch_web
                 result3 = await _fetch_web(args.get("symbol", sym), sym)
                 return result3
             return result
 
         elif name == "compare_companies":
-            # ── FIXED: smart compare with 3-layer fallback ────
             sym1_raw = args.get("symbol1", "")
             sym2_raw = args.get("symbol2", "")
-
-            # Check if original query has more companies (3-way compare)
-            extra = _extract_compare_companies(original_query)
-            all_syms = list(dict.fromkeys([sym1_raw, sym2_raw] + extra))  # dedup preserve order
-
+            extra    = _extract_compare_companies(original_query)
+            all_syms = list(dict.fromkeys([sym1_raw, sym2_raw] + extra))
             if len(all_syms) > 2:
                 return await smart_compare_multi(all_syms[:4])
             else:
@@ -471,6 +465,5 @@ class FinancialAgent:
 
 
 def _fundamentals_ok(data: dict) -> bool:
-    """Check Yahoo data has at least some useful fields."""
     useful = ["market_cap", "revenue", "pe_ratio", "eps", "profit_margin"]
     return any(data.get(f) for f in useful)
