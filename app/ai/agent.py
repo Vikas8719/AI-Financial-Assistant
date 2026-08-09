@@ -8,6 +8,16 @@ Rate Limit Strategy:
 
 Jab primary model 429 de → automatically fallback use hota hai.
 User ko pata bhi nahi chalta — seamless experience.
+
+FIX (2026-08-09): Tools ab TEENO models ko diye jaate hain, sirf
+PRIMARY ko nahi. Pehle jab primary rate-limit hota tha aur fallback
+model use hota tha, us fallback call mein tools bhi nahi jaate the —
+isliye bot real-time stock/news tools call hi nahi kar paata tha aur
+khud keh deta tha "mujhe real-time data ka access nahi hai", jabki
+Finnhub/Yahoo/web-search services bilkul sahi kaam kar rahe the.
+Groq ke teeno models (gpt-oss-120b, llama-3.3-70b-versatile,
+llama-3.1-8b-instant) tool-calling support karte hain, isliye ab
+tools hamesha pass honge, chahe kaunsa bhi model cascade mein use ho.
 ─────────────────────────────────────────────────────────────────
 """
 import json
@@ -55,7 +65,11 @@ async def _call_llm(messages, max_tokens: int, temperature: float, tools=None) -
     """
     Try PRIMARY → FALLBACK → FAST_MODEL on rate limit.
     Returns (response, model_used).
-    Tools only passed to PRIMARY — fallback works without tools.
+
+    FIX: Tools ab HAR model ko diye jaate hain (pehle sirf PRIMARY ko
+    milte the, jisse fallback ke waqt bot real-time data tools access
+    hi nahi kar paata tha). Groq ke teeno models tool-calling support
+    karte hain, isliye ye safe hai.
     """
     models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL, FAST_MODEL]
 
@@ -67,8 +81,9 @@ async def _call_llm(messages, max_tokens: int, temperature: float, tools=None) -
                 max_tokens  = max_tokens,
                 temperature = temperature,
             )
-            # Tools only on primary model (others may not support all tools)
-            if tools and model == PRIMARY_MODEL:
+            # Tools ab sabhi models ko milte hain — real-time data
+            # access kabhi bhi na ruke, chahe fallback model chal raha ho.
+            if tools:
                 kwargs["tools"]       = tools
                 kwargs["tool_choice"] = "auto"
 
@@ -87,7 +102,13 @@ async def _call_llm(messages, max_tokens: int, temperature: float, tools=None) -
                 raise e
 
         except Exception as e:
-            # Non-rate-limit error — don't try fallback
+            # Agar current model tools ke saath fail hua (e.g. kabhi
+            # kisi model ne tool schema reject kiya) to bina tools ke
+            # retry na karke seedha next model try karo, warna
+            # error propagate karo taaki upar wala handler sambhal le.
+            if tools and i < len(models_to_try) - 1:
+                logger.warning(f"⚠️ {model} errored ({e}), trying {models_to_try[i+1]}...")
+                continue
             raise e
 
     raise RuntimeError("All models exhausted")
@@ -290,7 +311,7 @@ class FinancialAgent:
 
         msg = response.choices[0].message
 
-        # ── Tool execution (only on primary model responses) ───
+        # ── Tool execution (kisi bhi model ki response par ho sakta hai) ───
         if msg.tool_calls:
             tool_results = await self._execute_tools(
                 msg.tool_calls, user_id, user_profile, user_message
