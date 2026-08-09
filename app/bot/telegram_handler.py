@@ -1,11 +1,15 @@
 """
-Telegram webhook handler — speed optimized
+Telegram webhook handler — Crash-proof version
 ─────────────────────────────────────────────────────────────────
-Speed fixes:
-  ✅ Continuous typing indicator (user feels instant response)
-  ✅ asyncio.create_task for typing — non-blocking
-  ✅ Typing cancels automatically when reply sends
-  ✅ Fast document download (streaming)
+Fixes applied:
+  ✅ FIX 1: Bot instance lazy initialization (avoids startup crash)
+  ✅ FIX 2: All exceptions caught — bot never crashes on any update
+  ✅ FIX 3: Markdown parse error auto-retry without formatting
+  ✅ FIX 4: Typing task properly cancelled before send (no dangling tasks)
+  ✅ FIX 5: Empty/None text guard added
+  ✅ FIX 6: Message chunking with safe split (no mid-word cuts)
+  ✅ FIX 7: httpx timeout increased for large file downloads
+  ✅ FIX 8: Document file_size None check fixed
 """
 import asyncio
 import logging
@@ -13,6 +17,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from telegram import Bot, Message, Update
+from telegram.error import TelegramError
 
 from app.bot.message_router import route_text_message
 from app.bot.voice_handler import transcribe_voice
@@ -20,20 +25,29 @@ from app.config import settings
 from app.models.user_repo import get_or_create_user
 
 logger = logging.getLogger("finbot.handler")
-bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
-MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_FILE_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_MSG_LEN    = 4096
 
+# ── FIX 1: Lazy bot init — avoids crash if token is invalid at import time ──
+_bot: Optional[Bot] = None
+
+def get_bot() -> Bot:
+    global _bot
+    if _bot is None:
+        _bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    return _bot
+
+
+# ──────────────────────────────────────────────────────────────
+#  Typing indicator helper
+# ──────────────────────────────────────────────────────────────
 
 async def _keep_typing(chat_id: int, stop_event: asyncio.Event) -> None:
-    """
-    Send typing action every 4s until stop_event is set.
-    Telegram typing indicator lasts 5s — refresh every 4s.
-    This makes bot feel "alive" during long processing.
-    """
+    """Send typing action every 4s until stop_event is set."""
     while not stop_event.is_set():
         try:
-            await bot.send_chat_action(chat_id=chat_id, action="typing")
+            await get_bot().send_chat_action(chat_id=chat_id, action="typing")
         except Exception:
             pass
         try:
@@ -45,9 +59,40 @@ async def _keep_typing(chat_id: int, stop_event: asyncio.Event) -> None:
             pass
 
 
-async def handle_update(update_data: dict, db: AsyncSession) -> None:
+async def _run_with_typing(chat_id: int, coro):
+    """
+    Run coro while showing typing indicator.
+    Returns (result, error_or_None).
+    Always cancels typing cleanly — no dangling tasks.
+    """
+    stop_event  = asyncio.Event()
+    typing_task = asyncio.create_task(_keep_typing(chat_id, stop_event))
+    result, error = None, None
     try:
-        update  = Update.de_json(update_data, bot)
+        result = await coro
+    except Exception as e:
+        error = e
+    finally:
+        stop_event.set()
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+    return result, error
+
+
+# ──────────────────────────────────────────────────────────────
+#  Main update handler
+# ──────────────────────────────────────────────────────────────
+
+async def handle_update(update_data: dict, db: AsyncSession) -> None:
+    """
+    Entry point for all Telegram updates.
+    FIX 2: Top-level try/except — bot NEVER crashes on any update.
+    """
+    try:
+        update  = Update.de_json(update_data, get_bot())
         message: Optional[Message] = update.effective_message
         if not message:
             return
@@ -58,14 +103,17 @@ async def handle_update(update_data: dict, db: AsyncSession) -> None:
 
         user, _ = await get_or_create_user(
             db, sender.id,
-            username=sender.username,
-            first_name=sender.first_name,
-            last_name=sender.last_name,
+            username   = sender.username,
+            first_name = sender.first_name,
+            last_name  = sender.last_name,
         )
         chat_id = message.chat_id
 
+        # ── FIX 5: Guard empty text ──
         if message.text:
-            await _handle_text(message, db, user, chat_id)
+            text = message.text.strip()
+            if text:
+                await _handle_text(message, db, user, chat_id, text)
 
         elif message.voice or message.audio:
             await _handle_voice(message, db, user, chat_id)
@@ -76,78 +124,75 @@ async def handle_update(update_data: dict, db: AsyncSession) -> None:
         elif message.photo:
             await _send_message(
                 chat_id,
-                "📸 I can see your image. For best results, send PDFs or financial documents."
+                "📸 Image mili! PDF ya financial documents ke liye best results milte hain."
             )
 
     except Exception as e:
-        logger.exception(f"Error handling update: {e}")
+        # FIX 2: Log but NEVER re-raise — Telegram must always get 200 OK
+        logger.exception(f"❌ handle_update crash prevented: {e}")
 
 
-async def _handle_text(message: Message, db: AsyncSession, user, chat_id: int) -> None:
-    """Handle text message with continuous typing indicator."""
-    stop_event   = asyncio.Event()
-    typing_task  = asyncio.create_task(_keep_typing(chat_id, stop_event))
+# ──────────────────────────────────────────────────────────────
+#  Text handler
+# ──────────────────────────────────────────────────────────────
 
-    try:
-        reply = await route_text_message(db, user, message.text)
-    except Exception as e:
-        logger.exception(f"route_text_message error: {e}")
-        reply = "⚠️ Something went wrong. Please try again."
-    finally:
-        stop_event.set()
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+async def _handle_text(
+    message: Message, db: AsyncSession, user, chat_id: int, text: str
+) -> None:
+    result, error = await _run_with_typing(
+        chat_id,
+        route_text_message(db, user, text)
+    )
+    if error:
+        logger.exception(f"route_text_message error: {error}")
+        reply = "⚠️ Kuch galat ho gaya. Please dobara try karein."
+    else:
+        reply = result or "⚠️ Response generate nahi hua."
 
     await _send_message(chat_id, reply)
 
 
-async def _handle_voice(message: Message, db: AsyncSession, user, chat_id: int) -> None:
-    stop_event  = asyncio.Event()
-    typing_task = asyncio.create_task(_keep_typing(chat_id, stop_event))
+# ──────────────────────────────────────────────────────────────
+#  Voice handler
+# ──────────────────────────────────────────────────────────────
 
-    try:
-        transcript = await transcribe_voice(message, bot)
-    finally:
-        stop_event.set()
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+async def _handle_voice(
+    message: Message, db: AsyncSession, user, chat_id: int
+) -> None:
+    transcript, t_error = await _run_with_typing(
+        chat_id,
+        transcribe_voice(message, get_bot())
+    )
 
-    if not transcript or transcript.startswith("Voice transcription failed"):
+    if t_error or not transcript or transcript.startswith("Voice transcription failed"):
         await _send_message(
             chat_id,
-            "⚠️ Couldn't transcribe that. Please try again or type your message."
+            "⚠️ Audio samajh nahi aaya. Please dobara bolein ya type karein."
         )
         return
 
     await _send_message(
         chat_id,
-        f"🎙️ *I heard:* _{transcript}_",
+        f"🎙️ *Suna:* _{transcript}_",
         parse_mode="Markdown"
     )
 
-    stop_event2  = asyncio.Event()
-    typing_task2 = asyncio.create_task(_keep_typing(chat_id, stop_event2))
-    try:
-        reply = await route_text_message(db, user, transcript)
-    except Exception as e:
-        logger.exception(f"Voice route error: {e}")
-        reply = "⚠️ Something went wrong. Please try again."
-    finally:
-        stop_event2.set()
-        typing_task2.cancel()
-        try:
-            await typing_task2
-        except asyncio.CancelledError:
-            pass
+    result, r_error = await _run_with_typing(
+        chat_id,
+        route_text_message(db, user, transcript)
+    )
+    if r_error:
+        logger.exception(f"Voice route error: {r_error}")
+        reply = "⚠️ Kuch galat ho gaya. Please dobara try karein."
+    else:
+        reply = result or "⚠️ Response generate nahi hua."
 
     await _send_message(chat_id, reply)
 
+
+# ──────────────────────────────────────────────────────────────
+#  Document handler
+# ──────────────────────────────────────────────────────────────
 
 async def _handle_document(
     message: Message, db: AsyncSession, user_id: int, chat_id: int
@@ -155,88 +200,142 @@ async def _handle_document(
     doc      = message.document
     filename = doc.file_name or "document.pdf"
 
-    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
-        await _send_message(chat_id, "⚠️ File too large. Please send documents under 20 MB.")
+    # ── FIX 8: file_size can be None ──
+    file_size = doc.file_size or 0
+    if file_size > MAX_FILE_BYTES:
+        await _send_message(chat_id, "⚠️ File bahut badi hai. 20 MB se chhoti file bhejein.")
         return
 
     await _send_message(
         chat_id,
-        f"📄 Processing *{filename}*… this may take a moment.",
+        f"📄 *{filename}* process ho raha hai… thoda wait karein.",
         parse_mode="Markdown"
     )
 
-    stop_event  = asyncio.Event()
-    typing_task = asyncio.create_task(_keep_typing(chat_id, stop_event))
-
-    try:
-        file = await bot.get_file(doc.file_id)
+    async def _process():
         import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        from app.services.document_service import DocumentService
+
+        file_obj = await get_bot().get_file(doc.file_id)
+        # ── FIX 7: Larger timeout for big files ──
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response   = await client.get(
-                f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file.file_path}"
+                f"https://api.telegram.org/file/bot{settings.TELEGRAM_BOT_TOKEN}/{file_obj.file_path}"
             )
             file_bytes = response.content
 
-        logger.info(f"Downloaded {filename}: {len(file_bytes)} bytes")
-
         if len(file_bytes) < 10:
-            stop_event.set()
-            await _send_message(chat_id, "⚠️ File appears to be empty. Please try uploading again.")
-            return
+            return "⚠️ File empty lag rahi hai. Dobara upload karein."
 
         ext       = filename.lower().rsplit(".", 1)[-1] if "." in filename else "pdf"
         file_type = "pdf" if ext == "pdf" else "docx" if ext in ("docx", "doc") else "pdf"
 
-        from app.services.document_service import DocumentService
         doc_service = DocumentService(db)
         saved       = await doc_service.process_document(
             user_id, filename, file_bytes, file_type=file_type
         )
 
         content_len = len(saved.content or "")
-        logger.info(f"Document saved: id={saved.id}, chars={content_len}")
-
         if content_len < 50:
-            reply = (
-                f"⚠️ *{saved.filename}* uploaded but text extraction failed.\n\n"
-                "This may happen with scanned/image-based PDFs. "
-                "Try a text-based PDF or paste the text directly."
+            return (
+                f"⚠️ *{saved.filename}* upload to hua lekin text extract nahi ho saka.\n\n"
+                "Scanned/image PDF hai? Text-based PDF try karein ya text paste karein."
             )
-        else:
-            reply = (
-                f"✅ *{saved.filename}* uploaded successfully.\n\n"
-                f"*Summary:*\n{saved.summary}\n\n"
-                "💬 Ask me anything about this document."
-            )
+        return (
+            f"✅ *{saved.filename}* successfully upload ho gaya.\n\n"
+            f"*Summary:*\n{saved.summary}\n\n"
+            "💬 Koi bhi sawaal poochh sakte hain is document ke baare mein."
+        )
 
-    except Exception as e:
-        logger.exception(f"Document processing failed: {e}")
-        reply = "⚠️ Something went wrong. Please try again with a valid PDF."
-    finally:
-        stop_event.set()
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+    result, error = await _run_with_typing(chat_id, _process())
+    if error:
+        logger.exception(f"Document processing failed: {error}")
+        reply = "⚠️ Document process nahi hua. Valid PDF try karein."
+    else:
+        reply = result
 
     await _send_message(chat_id, reply, parse_mode="Markdown")
 
 
+# ──────────────────────────────────────────────────────────────
+#  Safe message sender
+# ──────────────────────────────────────────────────────────────
+
 async def _send_message(
-    chat_id: int, text: str, parse_mode: str = None
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = None
 ) -> None:
-    max_len = 4096
-    chunks  = [text[i:i + max_len] for i in range(0, len(text), max_len)]
+    """
+    Send message with:
+    - FIX 6: Safe chunking (split on newlines, not mid-word)
+    - FIX 3: Auto-retry without parse_mode on Markdown errors
+    """
+    if not text or not text.strip():
+        return
+
+    chunks = _safe_split(text, MAX_MSG_LEN)
+    bot    = get_bot()
+
     for chunk in chunks:
+        if not chunk.strip():
+            continue
         try:
             await bot.send_message(
-                chat_id=chat_id, text=chunk, parse_mode=parse_mode
+                chat_id=chat_id,
+                text=chunk,
+                parse_mode=parse_mode
             )
+        except TelegramError as e:
+            err_str = str(e).lower()
+            # FIX 3: Markdown parse error → retry as plain text
+            if parse_mode and (
+                "can't parse" in err_str
+                or "parse" in err_str
+                or "entity" in err_str
+                or "offset" in err_str
+            ):
+                logger.warning(f"Markdown parse error, retrying as plain text: {e}")
+                try:
+                    # Strip Markdown characters for safe plain text
+                    plain = chunk.replace("*", "").replace("_", "").replace("`", "")
+                    await bot.send_message(chat_id=chat_id, text=plain)
+                except Exception as e2:
+                    logger.error(f"Plain text fallback also failed: {e2}")
+            else:
+                logger.error(f"send_message failed: {e}")
         except Exception as e:
-            logger.warning(f"send_message failed ({parse_mode}): {e}")
-            try:
-                # Retry without parse_mode (formatting error ho sakta hai)
-                await bot.send_message(chat_id=chat_id, text=chunk)
-            except Exception:
-                pass
+            logger.error(f"Unexpected send_message error: {e}")
+
+
+def _safe_split(text: str, max_len: int) -> list[str]:
+    """
+    FIX 6: Split long messages on newlines (not mid-word/mid-sentence).
+    Falls back to hard split only if a single line exceeds max_len.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+        # If adding this line would exceed limit, flush current chunk
+        candidate = current + "\n" + line if current else line
+        if len(candidate) > max_len:
+            if current:
+                chunks.append(current)
+                current = line
+            else:
+                # Single line too long — hard split
+                while len(line) > max_len:
+                    chunks.append(line[:max_len])
+                    line = line[max_len:]
+                current = line
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    return chunks
