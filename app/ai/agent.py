@@ -1,19 +1,19 @@
 """
-Main AI Agent — 4-Stage Pipeline with Full Fallback Chain
-─────────────────────────────────────────────────────────
-Fallback chain:
-  Yahoo Finance → Finnhub → Web Search → Graceful message
-  
-Key fixes:
-  ✅ tool_choice="none" in second LLM call (fixes 400 error)
-  ✅ All company names resolved to tickers before API calls
-  ✅ Every tool has 3-layer fallback — bot never crashes
-  ✅ Web search always available as last resort
+Main AI Agent — 4-Stage Pipeline
+─────────────────────────────────────────────────────────────────────
+Stage 1 │ Document: BM25 candidates (15)                    │ 0ms
+Stage 2 │ Memory: pgvector (semantic) + BM25 (keyword)      │ ~0.5s concurrent
+Stage 3 │ openai/gpt-oss-20b reranker → doc top-5         │ ~1s
+         │                               → memory top-3     │ (same call)
+Stage 4 │ openai/gpt-oss-120b → final answer            │ ~2s
+─────────────────────────────────────────────────────────────────────
+Compare fix:
+  compare_companies → smart_compare (3-layer fallback)
+  Yahoo fail → Finnhub → Web search + BM25 + reranker → 70b answer
+  User kabhi "encountered an error" nahi dekhega
 """
 import json
 import re
-import asyncio
-import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -31,14 +31,10 @@ from app.services.finnhub_service import FinnhubService
 from app.services.yahoo_finance import YahooFinanceService
 from app.services.sec_edgar import SecEdgarService
 from app.services.web_search import WebSearchService
-from app.services.compare_service import (
-    smart_compare, smart_compare_multi, resolve_ticker
-)
+from app.services.compare_service import smart_compare, smart_compare_multi, resolve_ticker
 
-logger = logging.getLogger("finbot.agent")
-
-MAIN_MODEL     = "openai/gpt-oss-120b"
 RERANKER_MODEL = "openai/gpt-oss-20b"
+MAIN_MODEL     = "openai/gpt-oss-120b"
 
 main_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 finnhub     = FinnhubService()
@@ -51,227 +47,107 @@ search      = WebSearchService()
 #  Query Classifier
 # ──────────────────────────────────────────────────────────────
 
-CONVERSATIONAL_OVERRIDES = {
-    "hi", "hello", "hey", "hii", "helo", "hola",
-    "how are you", "how r u", "how are you doing",
-    "good morning", "good evening", "good night", "good afternoon",
-    "thanks", "thank you", "ok", "okay", "sure", "got it",
-    "bye", "goodbye", "see you", "later", "yes", "no", "yep", "nope",
-    "what's up", "whats up", "sup", "wassup",
-    "help", "what can you do", "what do you do",
-}
-
-
-def _is_conversational_override(q: str) -> bool:
-    q_stripped = q.strip().lower().rstrip("!?.,:;")
-    if q_stripped in CONVERSATIONAL_OVERRIDES:
-        return True
-    words = q_stripped.split()
-    if len(words) <= 4:
-        if words[0] in {"hi", "hello", "hey", "hii", "helo", "greetings", "howdy"}:
-            return True
-        if len(words) >= 3 and words[0] == "how" and words[1] == "are":
-            return True
-    return False
-
-
 def classify_query(query: str) -> str:
     q = query.lower().strip()
 
-    if _is_conversational_override(q):
-        return "conversational"
-
-    if any(re.search(p, q) for p in [
-        r'\bprice\b', r'\bstock\b', r'\bquote\b', r'\bmarket cap\b',
-        r'\bdividend\b', r'\bearning[s]?\b', r'\brevenue\b', r'\bprofit\b',
-        r'\bebitda\b', r'\bdebt\b', r'\bshare price\b', r'\bvolume\b',
-        r'\bcrore\b', r'\bbillion\b', r'\bmillion\b', r'\byield\b',
-        r'\bsubscriber[s]?\b', r'\barpu\b', r'\beps\b', r'\bpe\b',
-        r'\broe\b', r'\bcash\b', r'\bmargin\b', r'\bresearch\b',
-    ]):
+    factual = [
+        r'\bprice\b', r'\bstock\b', r'\bquote\b', r'\beps\b', r'\bpe\b',
+        r'\bmarket cap\b', r'\bdividend\b', r'\bearning[s]?\b', r'\brevenue\b',
+        r'\bprofit\b', r'\bebitda\b', r'\bdebt\b', r'\bshare price\b',
+        r'\b52.week\b', r'\bvolume\b', r'\bopen\b', r'\bclose\b',
+        r'\bhigh\b', r'\blow\b', r'\bchange\b', r'\bpercent\b',
+        r'\b%\b', r'\bcrore\b', r'\bbillion\b', r'\bmillion\b',
+        r'\byield\b', r'\brate\b', r'\bsubscriber[s]?\b', r'\barpu\b'
+    ]
+    if any(re.search(p, q) for p in factual):
         return "factual"
 
-    if any(re.search(p, q) for p in [
-        r'\bdocument\b', r'\breport\b', r'\bfiling\b', r'\b10.?k\b',
-        r'\b10.?q\b', r'\bannual\b', r'\bpdf\b', r'\baccording to\b',
-        r'\bsec\b', r'\bedgar\b', r'\baudit\b',
-    ]):
-        return "document"
-
-    if any(re.search(p, q) for p in [
-        r'\banalyze\b', r'\banalysis\b', r'\bcompare\b', r'\bvs\b',
-        r'\bversus\b', r'\bwhy\b', r'\bhow (does|did|do|is|was|will|can|much|many)\b',
-        r'\bexplain\b', r'\boutlook\b', r'\bforecast\b', r'\brisk\b',
-        r'\bcompetitor\b', r'\bindustry\b', r'\bsector\b', r'\btrend\b',
-        r'\bperformance\b', r'\bgrowth\b', r'\bstrategy\b', r'\bvaluation\b',
-    ]):
+    compare = [
+        r'\bcompare\b', r'\bvs\b', r'\bversus\b', r'\bbetter\b',
+        r'\bwhich\b.*\bbetter\b', r'\bdifference\b', r'\bsimilar\b'
+    ]
+    if any(re.search(p, q) for p in compare):
         return "analytical"
 
-    if any(re.search(p, q) for p in [
-        r'\bsummariz\b', r'\bbrief\b', r'\boverview\b', r'\bmorning\b',
-        r'\bwhat.s happening\b', r'\bupdate me\b', r'\bwhat happened\b',
-    ]):
+    document = [
+        r'\bdocument\b', r'\breport\b', r'\bfiling\b', r'\b10.?k\b',
+        r'\b10.?q\b', r'\bannual\b', r'\bpdf\b', r'\bpage\b',
+        r'\baccording to\b', r'\bstated\b', r'\bmentioned\b',
+        r'\bsec\b', r'\bedgar\b', r'\baudit\b', r'\bnote\b'
+    ]
+    if any(re.search(p, q) for p in document):
+        return "document"
+
+    analytical = [
+        r'\banalyze\b', r'\banalysis\b', r'\bwhy\b', r'\bhow\b',
+        r'\bexplain\b', r'\bunderstand\b', r'\boutlook\b', r'\bforecast\b',
+        r'\bguidance\b', r'\brisk\b', r'\bopportunity\b',
+        r'\bcompetitor\b', r'\bindustry\b', r'\bsector\b',
+        r'\btrend\b', r'\bperformance\b', r'\bgrowth\b',
+        r'\bstrategy\b', r'\bvaluation\b', r'\bimpact\b'
+    ]
+    if any(re.search(p, q) for p in analytical):
+        return "analytical"
+
+    creative = [
+        r'\bsummariz\b', r'\bbrief\b', r'\boverview\b', r'\bdigest\b',
+        r'\btop news\b', r'\bmorning\b', r'\bwhat.s happening\b',
+        r'\bupdate me\b', r'\bwhat happened\b'
+    ]
+    if any(re.search(p, q) for p in creative):
         return "creative"
 
     return "conversational"
 
 
 TEMPERATURE_MAP = {
-    "factual": 0.0, "document": 0.1, "analytical": 0.2,
-    "creative": 0.45, "conversational": 0.4,
+    "factual":        0.0,
+    "document":       0.1,
+    "analytical":     0.2,
+    "creative":       0.45,
+    "conversational": 0.4,
 }
+
 MAX_TOKENS_MAP = {
-    "factual": 512, "document": 1200, "analytical": 1500,
-    "creative": 900, "conversational": 450,
+    "factual":        512,
+    "document":       1200,
+    "analytical":     1800,   # Compare needs more tokens
+    "creative":       900,
+    "conversational": 450,
 }
 
 
 # ──────────────────────────────────────────────────────────────
-#  Fallback helpers
+#  Compare query parser
 # ──────────────────────────────────────────────────────────────
 
-def _has_useful_data(result: dict) -> bool:
-    if not result or result.get("error"):
-        return False
-    useful_keys = ["price", "revenue", "market_cap", "news", "filings",
-                   "results", "answer", "indices", "earnings", "content",
-                   "pe_ratio", "eps", "profit_margin", "name"]
-    return any(result.get(k) for k in useful_keys)
+def _extract_compare_companies(query: str) -> list[str]:
+    """
+    Extract company names/tickers from a compare query.
+    "compare Tesla and Google" → ["Tesla", "Google"]
+    "TSLA vs MSFT vs AAPL"   → ["TSLA", "MSFT", "AAPL"]
+    """
+    q = query.lower()
 
+    # Remove compare trigger words
+    q = re.sub(
+        r'\b(compare|comparison|between|versus|vs\.?|and|or|with|,)\b',
+        ' ', q, flags=re.IGNORECASE
+    )
 
-async def _web_search_fallback(query: str, context: str = "") -> dict:
-    """Web search — always available as last resort."""
-    try:
-        full_query = f"{context} {query}".strip() if context else query
-        result = await search.search(full_query)
-        if result and (result.get("results") or result.get("answer")):
-            return {"_source": "web_search", **result}
-    except Exception as e:
-        logger.warning(f"Web search fallback also failed: {e}")
-    return {"_source": "web_search_failed", "answer": "No data found.", "results": []}
+    # Split on whitespace, filter short words
+    tokens = [t.strip() for t in q.split() if len(t.strip()) > 1]
 
+    # Filter out filler words
+    skip = {
+        "the", "a", "an", "to", "for", "of", "me", "please", "show",
+        "give", "tell", "their", "financials", "metrics", "stocks",
+        "companies", "company", "stock", "price", "data"
+    }
+    candidates = [t for t in tokens if t not in skip]
 
-# ──────────────────────────────────────────────────────────────
-#  Tool execution with 3-layer fallback
-# ──────────────────────────────────────────────────────────────
-
-async def _call_tool_with_fallback(
-    name: str, args: dict, user_id: int, query: str, db
-) -> dict:
-    """Every tool has: Primary → Fallback → Web Search → Never crashes."""
-
-    # Resolve company names to tickers
-    symbol = resolve_ticker(args.get("symbol", args.get("symbol1", "")))
-
-    # ── get_stock_price ──────────────────────────────────────
-    if name == "get_stock_price":
-        result = await finnhub.get_quote(symbol)
-        if _has_useful_data(result):
-            return result
-        logger.info(f"Finnhub failed for {symbol}, trying Yahoo...")
-        r2 = await yahoo.get_fundamentals(symbol)
-        if r2.get("market_cap") or r2.get("eps") or r2.get("price"):
-            return {**r2, "_source": "yahoo_fallback"}
-        logger.info(f"Yahoo also failed for {symbol}, using web search...")
-        return await _web_search_fallback(f"{symbol} stock price today current", symbol)
-
-    # ── get_company_news ─────────────────────────────────────
-    elif name == "get_company_news":
-        result = await finnhub.get_company_news(symbol, args.get("days", 7))
-        if result.get("news"):
-            return result
-        company = args.get("company", symbol)
-        return await _web_search_fallback(f"{company} latest news today", symbol)
-
-    # ── get_company_fundamentals (most likely to fail with 429) ──
-    elif name == "get_company_fundamentals":
-        # Layer 1: Yahoo
-        result = await yahoo.get_fundamentals(symbol)
-        if _has_useful_data(result):
-            return result
-        # Layer 2: Finnhub
-        logger.info(f"Yahoo 429 for {symbol}, trying Finnhub...")
-        try:
-            profile = finnhub.client.company_profile2(symbol=symbol)
-            quote   = await finnhub.get_quote(symbol)
-            if profile or _has_useful_data(quote):
-                return {
-                    "symbol":    symbol,
-                    "name":      (profile or {}).get("name", symbol),
-                    "market_cap":(profile or {}).get("marketCapitalization"),
-                    "industry":  (profile or {}).get("finnhubIndustry"),
-                    "price":     quote.get("price"),
-                    "change_pct":quote.get("change_pct"),
-                    "_source":   "finnhub_fallback"
-                }
-        except Exception as e:
-            logger.info(f"Finnhub also failed: {e}")
-        # Layer 3: Web search
-        logger.info(f"Using web search for {symbol} fundamentals...")
-        return await _web_search_fallback(
-            f"{symbol} stock revenue earnings PE ratio market cap financials 2024", symbol
-        )
-
-    # ── compare_companies — uses smart_compare with full fallback ──
-    elif name == "compare_companies":
-        sym1 = resolve_ticker(args.get("symbol1", ""))
-        sym2 = resolve_ticker(args.get("symbol2", ""))
-        return await smart_compare(sym1, sym2)
-
-    # ── get_market_overview ──────────────────────────────────
-    elif name == "get_market_overview":
-        result = await yahoo.get_market_overview()
-        if result.get("indices"):
-            return result
-        return await _web_search_fallback(
-            "stock market overview today S&P 500 NASDAQ Nifty 50 performance"
-        )
-
-    # ── get_earnings_calendar ────────────────────────────────
-    elif name == "get_earnings_calendar":
-        result = await finnhub.get_earnings_calendar(args.get("days", 7))
-        if result.get("earnings"):
-            return result
-        return await _web_search_fallback("earnings calendar this week upcoming results")
-
-    # ── search_sec_filings ───────────────────────────────────
-    elif name == "search_sec_filings":
-        result = await sec.search_filings(
-            args.get("company_name", ""), args.get("filing_type", "10-K")
-        )
-        if result.get("filings"):
-            return result
-        return await _web_search_fallback(
-            f"{args.get('company_name','')} {args.get('filing_type','10-K')} SEC EDGAR filing"
-        )
-
-    # ── web_search ───────────────────────────────────────────
-    elif name == "web_search":
-        return await search.search(args.get("query", query))
-
-    # ── set_alert ────────────────────────────────────────────
-    elif name == "set_alert":
-        from app.models.user_repo import create_alert
-        await create_alert(db, user_id, args)
-        return {"status": "Alert created", "details": args}
-
-    # ── Gmail + Calendar ─────────────────────────────────────
-    elif name == "get_gmail_summary":
-        from app.services.google_service import GoogleService
-        return await GoogleService(user_id, db).search_emails(args.get("query", ""))
-
-    elif name == "get_calendar_events":
-        from app.services.google_service import GoogleService
-        return await GoogleService(user_id, db).get_upcoming_events(args.get("days", 7))
-
-    # ── Document Q&A ─────────────────────────────────────────
-    elif name == "analyze_document":
-        from app.services.document_service import DocumentService
-        return await DocumentService(db).answer_question(
-            user_id, args.get("question", ""), args.get("document_id")
-        )
-
-    return {"error": f"Unknown tool: {name}"}
+    # Return up to 4 companies
+    return candidates[:4] if candidates else []
 
 
 # ──────────────────────────────────────────────────────────────
@@ -291,182 +167,310 @@ class FinancialAgent:
         document_context: Optional[str] = None
     ) -> str:
 
+        # ── Stage 0: Classify query ────────────────────────────
         query_type  = classify_query(user_message)
         temperature = TEMPERATURE_MAP[query_type]
         max_tokens  = MAX_TOKENS_MAP[query_type]
 
-        # ── Step 1: RAG retrieval ─────────────────────────────
+        # ── Stage 1: BM25 + Hybrid memory (concurrent) ────────
+        import asyncio
+
         async def _doc_retrieval():
             if not document_context or len(document_context.strip()) < 100:
                 return None
             return self.rag.retrieve_candidates(
-                query=user_message, document_content=document_context, top_k=15
+                query=user_message,
+                document_content=document_context,
+                top_k=15
             )
 
         async def _memory_retrieval():
-            if len(user_message.strip()) < 15:
-                return []
             return await search_memory_hybrid(
-                db=self.db, user_id=user_id, query=user_message, top_k=8
+                db=self.db,
+                user_id=user_id,
+                query=user_message,
+                top_k=8
             )
 
         doc_result, hybrid_memories = await asyncio.gather(
-            _doc_retrieval(), _memory_retrieval()
+            _doc_retrieval(),
+            _memory_retrieval()
         )
 
+        # ── Stage 2a: Rerank document chunks (8b) ─────────────
         final_doc_context = ""
         doc_chunks_used   = 0
 
         if doc_result and doc_result.get("chunks"):
-            reranked = await rerank_chunks(
-                query=user_message, chunks=doc_result["chunks"], top_k=5,
-                context_hint=f"User: {user_profile.get('role','finance professional')}"
+            reranked_chunks = await rerank_chunks(
+                query=user_message,
+                chunks=doc_result["chunks"],
+                top_k=5,
+                context_hint=f"User is a {user_profile.get('role', 'finance professional')}"
             )
-            final_doc_context = self.rag.build_context_from_chunks(reranked)
-            doc_chunks_used   = len(reranked)
-            if reranked and reranked[0].get("rerank_score", 0) >= 6 and query_type != "factual":
+            final_doc_context = self.rag.build_context_from_chunks(reranked_chunks)
+            doc_chunks_used   = len(reranked_chunks)
+
+            top_score = reranked_chunks[0].get("rerank_score", 0) if reranked_chunks else 0
+            if top_score >= 6 and query_type not in ("factual",):
                 query_type  = "document"
                 temperature = TEMPERATURE_MAP["document"]
                 max_tokens  = MAX_TOKENS_MAP["document"]
 
+        # ── Stage 2b: Rerank hybrid memories (8b) ─────────────
         rag_memory = ""
         if hybrid_memories:
-            relevant = await rerank_memory(user_message, hybrid_memories, top_k=3)
-            if relevant:
-                rag_memory = "\n".join(
-                    f"[Mem {i+1}]: {m[:200]}{'...' if len(m)>200 else ''}"
-                    for i, m in enumerate(relevant)
-                )
+            relevant_memories = await rerank_memory(
+                query=user_message,
+                memories=hybrid_memories,
+                top_k=3
+            )
+            if relevant_memories:
+                lines = []
+                for i, mem in enumerate(relevant_memories, 1):
+                    snippet = mem[:250] + "..." if len(mem) > 250 else mem
+                    lines.append(f"[Memory {i}]: {snippet}")
+                rag_memory = "\n".join(lines)
 
-        # ── Step 2: Build prompt ──────────────────────────────
-        history          = await get_recent_history(self.db, user_id, limit=8)
-        now              = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        # ── Build system prompt ────────────────────────────────
+        history = await get_recent_history(self.db, user_id, limit=10)
+        now     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         user_profile_str = json.dumps(user_profile, ensure_ascii=False)
 
-        context_parts = [f"Time: {now}"]
+        context_parts = [f"Current time: {now}"]
         if final_doc_context:
             context_parts.append(
-                f"\n📄 DOCUMENT ({doc_chunks_used} sections):\n{final_doc_context[:4000]}"
+                f"\n📄 DOCUMENT EXCERPTS — BM25 retrieved, AI reranked "
+                f"({doc_chunks_used} sections):\n\n{final_doc_context[:4500]}"
             )
         if rag_memory:
-            context_parts.append(f"\n🧠 MEMORY:\n{rag_memory}")
+            context_parts.append(
+                f"\n🧠 RELEVANT PAST CONTEXT — pgvector + BM25 hybrid, AI reranked:\n{rag_memory}"
+            )
 
         system_content = SYSTEM_PROMPT.format(
             context="\n".join(context_parts),
             user_profile=user_profile_str,
-            memory=rag_memory or "None."
+            memory=rag_memory or "No relevant past memory."
         )
 
+        # ── Build messages ─────────────────────────────────────
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system_content}
         ]
         for h in history[-8:]:
-            if h["role"] in ("user", "assistant"):
-                messages.append({"role": h["role"], "content": h["content"]})  # type: ignore[arg-type]
+            role = h["role"]
+            if role in ("user", "assistant", "system"):
+                messages.append({"role": role, "content": h["content"]})  # type: ignore[arg-type]
         messages.append({"role": "user", "content": user_message})
 
-        # ── Step 3: First LLM call ────────────────────────────
-        skip_tools = bool(
-            final_doc_context and doc_chunks_used >= 2
-            and query_type in ("document", "factual")
-        )
+        # ── Stage 3: Main 70b LLM call ────────────────────────
+        has_strong_context = bool(final_doc_context and doc_chunks_used >= 2)
+        skip_tools = has_strong_context and query_type in ("document", "factual")
 
         if skip_tools:
             response = await main_client.chat.completions.create(
-                model=MAIN_MODEL, messages=messages,
-                max_tokens=max_tokens, temperature=temperature
+                model=MAIN_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
             )
         else:
             response = await main_client.chat.completions.create(
-                model=MAIN_MODEL, messages=messages,
+                model=MAIN_MODEL,
+                messages=messages,
                 tools=TOOLS,  # type: ignore[arg-type]
                 tool_choice="auto",
-                max_tokens=max_tokens, temperature=temperature
+                max_tokens=max_tokens,
+                temperature=temperature
             )
 
         msg = response.choices[0].message
 
-        # ── Step 4: Tool execution + second LLM call ──────────
+        # ── Tool execution ─────────────────────────────────────
         if msg.tool_calls:
-            # Run all tools concurrently with fallback
-            tool_results = await asyncio.gather(*[
-                self._safe_tool_call(tc, user_id, user_message)
-                for tc in msg.tool_calls
-            ])
+            tool_results = await self._execute_tools(
+                msg.tool_calls, user_id, user_profile, user_message
+            )
 
-            messages.append({
+            assistant_msg: ChatCompletionMessageParam = {
                 "role": "assistant",
                 "content": msg.content or "",
                 "tool_calls": [  # type: ignore[typeddict-item]
                     {
-                        "id": tc.id, "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
                     }
                     for tc in msg.tool_calls
                 ]
-            })
-            for tc, result in zip(msg.tool_calls, tool_results):
+            }
+            messages.append(assistant_msg)
+
+            for tool_call, result in zip(msg.tool_calls, tool_results):
                 messages.append({
-                    "role": "tool",  # type: ignore[typeddict-item]
-                    "tool_call_id": tc.id,
+                    "role": "tool",          # type: ignore[typeddict-item]
+                    "tool_call_id": tool_call.id,
                     "content": json.dumps(result, ensure_ascii=False)
                 })
 
-            # ── Second LLM call — tool_choice="none" is CRITICAL ──
-            # Without this, model tries to call more tools → 400 error
-            try:
-                final = await main_client.chat.completions.create(
-                    model=MAIN_MODEL,
-                    messages=messages,
-                    tools=TOOLS,          # type: ignore[arg-type]
-                    tool_choice="none",   # ← KEY FIX
-                    max_tokens=max_tokens,
-                    temperature=min(temperature, 0.15)
-                )
-                answer = final.choices[0].message.content or "I couldn't generate a response."
-            except Exception as e:
-                logger.warning(f"Second LLM call failed ({e}), retrying without tools...")
-                try:
-                    final = await main_client.chat.completions.create(
-                        model=MAIN_MODEL,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=min(temperature, 0.15)
-                    )
-                    answer = final.choices[0].message.content or "I couldn't generate a response."
-                except Exception as e2:
-                    logger.error(f"Both LLM calls failed: {e2}")
-                    # Last resort: just web search and answer directly
-                    ws = await _web_search_fallback(user_message)
-                    answer = ws.get("answer") or "I'm having trouble fetching this data right now. Please try again in a moment."
-
+            # Final synthesis — cap temperature after tool data
+            final_response = await main_client.chat.completions.create(
+                model=MAIN_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=min(temperature, 0.15)
+            )
+            answer = final_response.choices[0].message.content or "I couldn't generate a response."
         else:
             answer = msg.content or "I couldn't generate a response."
 
-        # Save to memory (non-blocking)
-        await asyncio.gather(
-            save_message(self.db, user_id, "user", user_message),
-            save_message(self.db, user_id, "assistant", answer),
-            return_exceptions=True
-        )
+        # ── Save to DB ─────────────────────────────────────────
+        await save_message(self.db, user_id, "user", user_message)
+        await save_message(self.db, user_id, "assistant", answer)
+
         return answer
 
-    async def _safe_tool_call(self, tc: Any, user_id: int, query: str) -> dict:
-        """Execute one tool — never raises, always returns something useful."""
-        name = tc.function.name
-        try:
-            args = json.loads(tc.function.arguments)
-        except Exception:
-            args = {}
-        try:
-            return await _call_tool_with_fallback(name, args, user_id, query, self.db)
-        except Exception as e:
-            logger.error(f"Tool {name} completely failed: {e}")
-            # Absolute last resort
+    # ── Tool dispatcher ────────────────────────────────────────
+
+    async def _execute_tools(
+        self,
+        tool_calls: Any,
+        user_id: int,
+        user_profile: dict,
+        original_query: str = ""
+    ) -> list:
+        results = []
+        for tc in tool_calls:
+            name = tc.function.name
             try:
-                return await _web_search_fallback(query, name)
+                args = json.loads(tc.function.arguments)
             except Exception:
-                return {
-                    "note": "Data temporarily unavailable.",
-                    "suggestion": "Try rephrasing with a specific ticker like TSLA or AAPL"
+                args = {}
+            try:
+                result = await self._call_tool(name, args, user_id, original_query)
+            except Exception as e:
+                # Never propagate raw errors — return structured fallback
+                result = {
+                    "_tool_error": str(e),
+                    "_tool": name,
+                    "_note": "Data retrieval encountered an issue. Using available information."
                 }
+            results.append(result)
+        return results
+
+    async def _call_tool(
+        self,
+        name: str,
+        args: dict,
+        user_id: int,
+        original_query: str = ""
+    ) -> dict:
+
+        if name == "get_stock_price":
+            sym    = resolve_ticker(args.get("symbol", ""))
+            result = await finnhub.get_quote(sym)
+            # Fallback if Finnhub fails
+            if result.get("error"):
+                result2 = await yahoo.get_fundamentals(sym)
+                if not result2.get("error"):
+                    return result2
+                # Web search fallback
+                ws = await search.search(f"{sym} stock price today")
+                return {**result, "_web_fallback": ws.get("answer", ""), "_source": "web"}
+            return result
+
+        elif name == "get_company_news":
+            sym = resolve_ticker(args.get("symbol", ""))
+            result = await finnhub.get_company_news(sym, args.get("days", 7))
+            if result.get("error") or not result.get("news"):
+                ws = await search.search(f"{sym} company news latest")
+                return {"news": ws.get("results", []), "_source": "web_search"}
+            return result
+
+        elif name == "get_company_fundamentals":
+            sym    = resolve_ticker(args.get("symbol", ""))
+            result = await yahoo.get_fundamentals(sym)
+            if result.get("error") or not _fundamentals_ok(result):
+                # Finnhub fallback
+                from app.services.compare_service import _fetch_finnhub
+                result2 = await _fetch_finnhub(sym)
+                if not result2.get("error"):
+                    return result2
+                # Web search fallback
+                from app.services.compare_service import _fetch_web
+                result3 = await _fetch_web(args.get("symbol", sym), sym)
+                return result3
+            return result
+
+        elif name == "compare_companies":
+            # ── FIXED: smart compare with 3-layer fallback ────
+            sym1_raw = args.get("symbol1", "")
+            sym2_raw = args.get("symbol2", "")
+
+            # Check if original query has more companies (3-way compare)
+            extra = _extract_compare_companies(original_query)
+            all_syms = list(dict.fromkeys([sym1_raw, sym2_raw] + extra))  # dedup preserve order
+
+            if len(all_syms) > 2:
+                return await smart_compare_multi(all_syms[:4])
+            else:
+                return await smart_compare(sym1_raw, sym2_raw)
+
+        elif name == "search_sec_filings":
+            return await sec.search_filings(
+                args.get("company_name", ""), args.get("filing_type", "10-K")
+            )
+
+        elif name == "web_search":
+            return await search.search(args.get("query", ""))
+
+        elif name == "get_market_overview":
+            result = await yahoo.get_market_overview()
+            if not result or result.get("error"):
+                ws = await search.search("stock market overview today S&P NASDAQ")
+                return {"_web_fallback": ws.get("answer", ""), "results": ws.get("results", [])}
+            return result
+
+        elif name == "get_earnings_calendar":
+            result = await finnhub.get_earnings_calendar(args.get("days", 7))
+            if result.get("error"):
+                ws = await search.search("earnings calendar this week companies reporting")
+                return {"_web_fallback": ws.get("answer", ""), "_source": "web"}
+            return result
+
+        elif name == "set_alert":
+            from app.models.user_repo import create_alert
+            await create_alert(self.db, user_id, args)
+            return {"status": "Alert created", "details": args}
+
+        elif name == "get_gmail_summary":
+            from app.services.google_service import GoogleService
+            google = GoogleService(user_id, self.db)
+            return await google.search_emails(args.get("query", ""))
+
+        elif name == "get_calendar_events":
+            from app.services.google_service import GoogleService
+            google = GoogleService(user_id, self.db)
+            return await google.get_upcoming_events(args.get("days", 7))
+
+        elif name == "analyze_document":
+            from app.services.document_service import DocumentService
+            doc_service = DocumentService(self.db)
+            return await doc_service.answer_question(
+                user_id,
+                args.get("question", ""),
+                args.get("document_id")
+            )
+
+        else:
+            return {"error": f"Unknown tool: {name}"}
+
+
+def _fundamentals_ok(data: dict) -> bool:
+    """Check Yahoo data has at least some useful fields."""
+    useful = ["market_cap", "revenue", "pe_ratio", "eps", "profit_margin"]
+    return any(data.get(f) for f in useful)
