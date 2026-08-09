@@ -1,23 +1,44 @@
 """
-LLM Reranker — openai/gpt-os-20b on Groq
-─────────────────────────────────────────────────────────────────
-Speed optimizations:
-  ✅ openai/gpt-os-20b  (fastest Groq model, ~0.3s)
-  ✅ max_tokens=60          (score array only — was 100)
-  ✅ Skip reranking if chunks <= 3 (BM25 scores enough)
-  ✅ Timeout=4s             (was 8s — fail fast, BM25 fallback)
-  ✅ Memory reranking SKIPPED for simple/factual queries
+LLM Reranker — with model fallback
+FIX: openai/gpt-oss-20b rate limited → fallback to llama-3.1-8b-instant
+     8b model is near-unlimited and fast enough for reranking (just scores)
 """
 import json
 import re
+import logging
 
-from groq import AsyncGroq
+from groq import AsyncGroq, RateLimitError
 from app.config import settings
 
-RERANKER_MODEL   = "openai/gpt-oss-20b"   # Fastest Groq model
-RERANKER_TIMEOUT = 4.0                        # Fail fast → BM25 fallback
+logger = logging.getLogger("finbot.reranker")
+
+RERANKER_PRIMARY = "openai/gpt-oss-20b"
+RERANKER_FALLBACK = "llama-3.1-8b-instant"   # Fast, unlimited, good for scoring
+RERANKER_TIMEOUT  = 4.0
 
 reranker_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+
+
+async def _reranker_call(prompt: str, max_tokens: int) -> str:
+    """Try primary reranker → fallback on rate limit."""
+    for model in [RERANKER_PRIMARY, RERANKER_FALLBACK]:
+        try:
+            response = await reranker_client.chat.completions.create(
+                model       = model,
+                messages    = [{"role": "user", "content": prompt}],
+                max_tokens  = max_tokens,
+                temperature = 0.0,
+                timeout     = RERANKER_TIMEOUT
+            )
+            return response.choices[0].message.content or "[]"
+        except RateLimitError:
+            if model == RERANKER_PRIMARY:
+                logger.warning(f"Reranker {model} rate limited, trying {RERANKER_FALLBACK}")
+                continue
+            raise
+        except Exception:
+            raise
+    return "[]"
 
 
 async def rerank_chunks(
@@ -26,43 +47,30 @@ async def rerank_chunks(
     top_k: int = 5,
     context_hint: str = ""
 ) -> list[dict]:
-    """
-    Rerank BM25 chunks with openai/gpt-oss-20b.
-    Skip if chunks <= 3 (BM25 order is good enough).
-    """
+    """Rerank BM25 chunks. Skip if <=3 chunks — BM25 order is fine."""
     if not chunks:
         return []
 
-    # Fast path: <=3 chunks → skip reranker, use BM25 directly
     if len(chunks) <= 3:
         for c in chunks:
             c["rerank_score"] = c.get("bm25_score", 1.0)
             c["reranked"]     = False
         return sorted(chunks, key=lambda c: c.get("bm25_score", 0), reverse=True)[:top_k]
 
-    # Build compact prompt — short previews save tokens → faster
     chunks_text = ""
     for i, chunk in enumerate(chunks):
-        preview = chunk["text"][:200].replace("\n", " ").strip()  # 200 not 300
+        preview = chunk["text"][:200].replace("\n", " ").strip()
         chunks_text += f"[{i}]{preview}\n"
 
     prompt = (
-        f'Score each chunk 0-10 for relevance to: "{query}"\n'
+        f'Score 0-10 relevance to: "{query}"\n'
         f'{f"Context: {context_hint}" if context_hint else ""}\n'
-        f"10=directly answers, 0=irrelevant.\n\n"
         f"{chunks_text}\n"
-        f"Reply ONLY with JSON array: [score0, score1, ...]"
+        f"Reply ONLY: [score0, score1, ...]"
     )
 
     try:
-        response = await reranker_client.chat.completions.create(
-            model=RERANKER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
-            temperature=0.0,
-            timeout=RERANKER_TIMEOUT
-        )
-        raw    = response.choices[0].message.content or "[]"
+        raw    = await _reranker_call(prompt, max_tokens=60)
         scores = _parse_score_array(raw, expected_len=len(chunks))
 
         for i, chunk in enumerate(chunks):
@@ -76,7 +84,7 @@ async def rerank_chunks(
         return sorted(chunks, key=lambda c: c.get("hybrid_score", 0), reverse=True)[:top_k]
 
     except Exception:
-        # BM25 fallback — no delay
+        # BM25 fallback — no API call needed
         for chunk in chunks:
             chunk["rerank_score"] = chunk.get("bm25_score", 0.0)
             chunk["hybrid_score"] = chunk.get("bm25_score", 0.0)
@@ -89,9 +97,7 @@ async def rerank_memory(
     memories: list[str],
     top_k: int = 3
 ) -> list[str]:
-    """
-    Rerank memories — skip if only 1-2 memories (not worth an API call).
-    """
+    """Rerank memories. Skip if <=2."""
     if not memories:
         return []
     if len(memories) <= 2:
@@ -102,24 +108,16 @@ async def rerank_memory(
         for i, mem in enumerate(memories)
     )
     prompt = (
-        f'Rate memory relevance 0-10 for query: "{query}"\n'
+        f'Rate relevance 0-10 for: "{query}"\n'
         f"{mem_text}\n"
-        f"Reply ONLY with JSON array: [score0, score1, ...]"
+        f"Reply ONLY: [score0, score1, ...]"
     )
 
     try:
-        response = await reranker_client.chat.completions.create(
-            model=RERANKER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=40,
-            temperature=0.0,
-            timeout=RERANKER_TIMEOUT
-        )
-        raw    = response.choices[0].message.content or "[]"
+        raw    = await _reranker_call(prompt, max_tokens=40)
         scores = _parse_score_array(raw, expected_len=len(memories))
         scored = sorted(zip(scores, memories), key=lambda x: x[0], reverse=True)
         return [m for s, m in scored if s >= 4][:top_k]
-
     except Exception:
         return memories[:top_k]
 
