@@ -1,14 +1,14 @@
 """
-Main AI Agent — 4-Stage Pipeline with Automatic Fallback Chain
-─────────────────────────────────────────────────────────────────────
-Fallback chain for every tool:
-  Primary source → Fallback source → Web search → Graceful error message
-
+Main AI Agent — 4-Stage Pipeline with Full Fallback Chain
+─────────────────────────────────────────────────────────
+Fallback chain:
+  Yahoo Finance → Finnhub → Web Search → Graceful message
+  
 Key fixes:
   ✅ tool_choice="none" in second LLM call (fixes 400 error)
-  ✅ Yahoo 429 → Finnhub fallback → Web search fallback
-  ✅ All tool errors caught, web search used as last resort
-  ✅ Bot never crashes — always gives an answer
+  ✅ All company names resolved to tickers before API calls
+  ✅ Every tool has 3-layer fallback — bot never crashes
+  ✅ Web search always available as last resort
 """
 import json
 import re
@@ -31,6 +31,9 @@ from app.services.finnhub_service import FinnhubService
 from app.services.yahoo_finance import YahooFinanceService
 from app.services.sec_edgar import SecEdgarService
 from app.services.web_search import WebSearchService
+from app.services.compare_service import (
+    smart_compare, smart_compare_multi, resolve_ticker
+)
 
 logger = logging.getLogger("finbot.agent")
 
@@ -84,7 +87,7 @@ def classify_query(query: str) -> str:
         r'\bebitda\b', r'\bdebt\b', r'\bshare price\b', r'\bvolume\b',
         r'\bcrore\b', r'\bbillion\b', r'\bmillion\b', r'\byield\b',
         r'\bsubscriber[s]?\b', r'\barpu\b', r'\beps\b', r'\bpe\b',
-        r'\broe\b', r'\bcash\b', r'\bmargin\b',
+        r'\broe\b', r'\bcash\b', r'\bmargin\b', r'\bresearch\b',
     ]):
         return "factual"
 
@@ -124,21 +127,20 @@ MAX_TOKENS_MAP = {
 
 
 # ──────────────────────────────────────────────────────────────
-#  Fallback-aware tool executor
+#  Fallback helpers
 # ──────────────────────────────────────────────────────────────
 
 def _has_useful_data(result: dict) -> bool:
-    """Check if a tool result has meaningful data (not just an error)."""
     if not result or result.get("error"):
         return False
-    # Check for any non-None, non-error value
     useful_keys = ["price", "revenue", "market_cap", "news", "filings",
-                   "results", "answer", "indices", "earnings", "content"]
+                   "results", "answer", "indices", "earnings", "content",
+                   "pe_ratio", "eps", "profit_margin", "name"]
     return any(result.get(k) for k in useful_keys)
 
 
 async def _web_search_fallback(query: str, context: str = "") -> dict:
-    """Always-available fallback — web search never fails silently."""
+    """Web search — always available as last resort."""
     try:
         full_query = f"{context} {query}".strip() if context else query
         result = await search.search(full_query)
@@ -146,94 +148,84 @@ async def _web_search_fallback(query: str, context: str = "") -> dict:
             return {"_source": "web_search", **result}
     except Exception as e:
         logger.warning(f"Web search fallback also failed: {e}")
-    return {"_source": "web_search", "answer": "", "results": []}
+    return {"_source": "web_search_failed", "answer": "No data found.", "results": []}
 
 
-async def call_tool_with_fallback(name: str, args: dict, user_id: int, original_query: str, db) -> dict:
-    """
-    Execute a tool with automatic fallback chain:
-    1. Primary tool
-    2. Alternative data source
-    3. Web search
-    4. Graceful degradation message
-    """
-    symbol = args.get("symbol", args.get("symbol1", "")).upper().strip()
+# ──────────────────────────────────────────────────────────────
+#  Tool execution with 3-layer fallback
+# ──────────────────────────────────────────────────────────────
+
+async def _call_tool_with_fallback(
+    name: str, args: dict, user_id: int, query: str, db
+) -> dict:
+    """Every tool has: Primary → Fallback → Web Search → Never crashes."""
+
+    # Resolve company names to tickers
+    symbol = resolve_ticker(args.get("symbol", args.get("symbol1", "")))
 
     # ── get_stock_price ──────────────────────────────────────
     if name == "get_stock_price":
         result = await finnhub.get_quote(symbol)
         if _has_useful_data(result):
             return result
-        # Fallback: Yahoo Finance
         logger.info(f"Finnhub failed for {symbol}, trying Yahoo...")
         r2 = await yahoo.get_fundamentals(symbol)
-        if r2.get("market_cap") or r2.get("eps"):
+        if r2.get("market_cap") or r2.get("eps") or r2.get("price"):
             return {**r2, "_source": "yahoo_fallback"}
-        # Fallback: Web search
-        logger.info(f"Yahoo failed for {symbol}, trying web search...")
-        return await _web_search_fallback(f"{symbol} stock price today", symbol)
+        logger.info(f"Yahoo also failed for {symbol}, using web search...")
+        return await _web_search_fallback(f"{symbol} stock price today current", symbol)
 
     # ── get_company_news ─────────────────────────────────────
     elif name == "get_company_news":
         result = await finnhub.get_company_news(symbol, args.get("days", 7))
         if result.get("news"):
             return result
-        # Fallback: Web search for news
-        company_name = args.get("company", symbol)
-        return await _web_search_fallback(f"{company_name} latest news", symbol)
+        company = args.get("company", symbol)
+        return await _web_search_fallback(f"{company} latest news today", symbol)
 
-    # ── get_company_fundamentals ─────────────────────────────
+    # ── get_company_fundamentals (most likely to fail with 429) ──
     elif name == "get_company_fundamentals":
+        # Layer 1: Yahoo
         result = await yahoo.get_fundamentals(symbol)
-        if _has_useful_data(result) or result.get("pe_ratio") or result.get("revenue"):
+        if _has_useful_data(result):
             return result
-        # Fallback 1: Finnhub profile
-        logger.info(f"Yahoo 429/error for {symbol}, trying Finnhub...")
+        # Layer 2: Finnhub
+        logger.info(f"Yahoo 429 for {symbol}, trying Finnhub...")
         try:
             profile = finnhub.client.company_profile2(symbol=symbol)
-            if profile:
+            quote   = await finnhub.get_quote(symbol)
+            if profile or _has_useful_data(quote):
                 return {
-                    "symbol": symbol,
-                    "company": profile.get("name"),
-                    "market_cap": profile.get("marketCapitalization"),
-                    "industry": profile.get("finnhubIndustry"),
-                    "country": profile.get("country"),
-                    "_source": "finnhub_fallback"
+                    "symbol":    symbol,
+                    "name":      (profile or {}).get("name", symbol),
+                    "market_cap":(profile or {}).get("marketCapitalization"),
+                    "industry":  (profile or {}).get("finnhubIndustry"),
+                    "price":     quote.get("price"),
+                    "change_pct":quote.get("change_pct"),
+                    "_source":   "finnhub_fallback"
                 }
-        except Exception:
-            pass
-        # Fallback 2: Web search
-        logger.info(f"Finnhub also failed for {symbol}, using web search...")
+        except Exception as e:
+            logger.info(f"Finnhub also failed: {e}")
+        # Layer 3: Web search
+        logger.info(f"Using web search for {symbol} fundamentals...")
         return await _web_search_fallback(
-            f"{symbol} stock financials revenue profit PE ratio market cap 2024", symbol
+            f"{symbol} stock revenue earnings PE ratio market cap financials 2024", symbol
         )
 
-    # ── compare_companies ────────────────────────────────────
+    # ── compare_companies — uses smart_compare with full fallback ──
     elif name == "compare_companies":
-        sym1, sym2 = args.get("symbol1", ""), args.get("symbol2", "")
-        d1 = await yahoo.get_fundamentals(sym1)
-        d2 = await yahoo.get_fundamentals(sym2)
-
-        # If either fails, try web search for comparison
-        if not _has_useful_data(d1) and not _has_useful_data(d2):
-            logger.info(f"Both Yahoo calls failed, using web search for comparison...")
-            return await _web_search_fallback(
-                f"compare {sym1} vs {sym2} stock financials revenue profit 2024"
-            )
-        if not _has_useful_data(d1):
-            ws = await _web_search_fallback(f"{sym1} stock financials 2024")
-            d1 = ws
-        if not _has_useful_data(d2):
-            ws = await _web_search_fallback(f"{sym2} stock financials 2024")
-            d2 = ws
-        return {"company1": d1, "company2": d2}
+        sym1 = resolve_ticker(args.get("symbol1", ""))
+        sym2 = resolve_ticker(args.get("symbol2", ""))
+        return await smart_compare(sym1, sym2)
 
     # ── get_market_overview ──────────────────────────────────
     elif name == "get_market_overview":
         result = await yahoo.get_market_overview()
         if result.get("indices"):
             return result
-        return await _web_search_fallback("stock market overview today S&P NASDAQ Nifty performance")
+        return await _web_search_fallback(
+            "stock market overview today S&P 500 NASDAQ Nifty 50 performance"
+        )
 
     # ── get_earnings_calendar ────────────────────────────────
     elif name == "get_earnings_calendar":
@@ -250,12 +242,12 @@ async def call_tool_with_fallback(name: str, args: dict, user_id: int, original_
         if result.get("filings"):
             return result
         return await _web_search_fallback(
-            f"{args.get('company_name','')} {args.get('filing_type','10-K')} SEC filing"
+            f"{args.get('company_name','')} {args.get('filing_type','10-K')} SEC EDGAR filing"
         )
 
     # ── web_search ───────────────────────────────────────────
     elif name == "web_search":
-        return await search.search(args.get("query", original_query))
+        return await search.search(args.get("query", query))
 
     # ── set_alert ────────────────────────────────────────────
     elif name == "set_alert":
@@ -263,12 +255,11 @@ async def call_tool_with_fallback(name: str, args: dict, user_id: int, original_
         await create_alert(db, user_id, args)
         return {"status": "Alert created", "details": args}
 
-    # ── Gmail ────────────────────────────────────────────────
+    # ── Gmail + Calendar ─────────────────────────────────────
     elif name == "get_gmail_summary":
         from app.services.google_service import GoogleService
         return await GoogleService(user_id, db).search_emails(args.get("query", ""))
 
-    # ── Calendar ─────────────────────────────────────────────
     elif name == "get_calendar_events":
         from app.services.google_service import GoogleService
         return await GoogleService(user_id, db).get_upcoming_events(args.get("days", 7))
@@ -315,9 +306,13 @@ class FinancialAgent:
         async def _memory_retrieval():
             if len(user_message.strip()) < 15:
                 return []
-            return await search_memory_hybrid(db=self.db, user_id=user_id, query=user_message, top_k=8)
+            return await search_memory_hybrid(
+                db=self.db, user_id=user_id, query=user_message, top_k=8
+            )
 
-        doc_result, hybrid_memories = await asyncio.gather(_doc_retrieval(), _memory_retrieval())
+        doc_result, hybrid_memories = await asyncio.gather(
+            _doc_retrieval(), _memory_retrieval()
+        )
 
         final_doc_context = ""
         doc_chunks_used   = 0
@@ -350,7 +345,9 @@ class FinancialAgent:
 
         context_parts = [f"Time: {now}"]
         if final_doc_context:
-            context_parts.append(f"\n📄 DOCUMENT ({doc_chunks_used} sections):\n{final_doc_context[:4000]}")
+            context_parts.append(
+                f"\n📄 DOCUMENT ({doc_chunks_used} sections):\n{final_doc_context[:4000]}"
+            )
         if rag_memory:
             context_parts.append(f"\n🧠 MEMORY:\n{rag_memory}")
 
@@ -369,8 +366,10 @@ class FinancialAgent:
         messages.append({"role": "user", "content": user_message})
 
         # ── Step 3: First LLM call ────────────────────────────
-        skip_tools = bool(final_doc_context and doc_chunks_used >= 2
-                          and query_type in ("document", "factual"))
+        skip_tools = bool(
+            final_doc_context and doc_chunks_used >= 2
+            and query_type in ("document", "factual")
+        )
 
         if skip_tools:
             response = await main_client.chat.completions.create(
@@ -387,20 +386,22 @@ class FinancialAgent:
 
         msg = response.choices[0].message
 
-        # ── Step 4: Tool execution with fallback chain ────────
+        # ── Step 4: Tool execution + second LLM call ──────────
         if msg.tool_calls:
             # Run all tools concurrently with fallback
             tool_results = await asyncio.gather(*[
                 self._safe_tool_call(tc, user_id, user_message)
                 for tc in msg.tool_calls
-            ], return_exceptions=False)
+            ])
 
             messages.append({
                 "role": "assistant",
                 "content": msg.content or "",
                 "tool_calls": [  # type: ignore[typeddict-item]
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    {
+                        "id": tc.id, "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                    }
                     for tc in msg.tool_calls
                 ]
             })
@@ -411,13 +412,14 @@ class FinancialAgent:
                     "content": json.dumps(result, ensure_ascii=False)
                 })
 
-            # ── Second LLM call — tool_choice="none" fixes 400 error ──
+            # ── Second LLM call — tool_choice="none" is CRITICAL ──
+            # Without this, model tries to call more tools → 400 error
             try:
                 final = await main_client.chat.completions.create(
                     model=MAIN_MODEL,
                     messages=messages,
-                    tools=TOOLS,         # type: ignore[arg-type]
-                    tool_choice="none",  # ← KEY FIX: no more tool calls in 2nd pass
+                    tools=TOOLS,          # type: ignore[arg-type]
+                    tool_choice="none",   # ← KEY FIX
                     max_tokens=max_tokens,
                     temperature=min(temperature, 0.15)
                 )
@@ -434,11 +436,14 @@ class FinancialAgent:
                     answer = final.choices[0].message.content or "I couldn't generate a response."
                 except Exception as e2:
                     logger.error(f"Both LLM calls failed: {e2}")
-                    answer = "⚠️ I encountered an issue. Please try rephrasing your question."
+                    # Last resort: just web search and answer directly
+                    ws = await _web_search_fallback(user_message)
+                    answer = ws.get("answer") or "I'm having trouble fetching this data right now. Please try again in a moment."
+
         else:
             answer = msg.content or "I couldn't generate a response."
 
-        # Save to memory
+        # Save to memory (non-blocking)
         await asyncio.gather(
             save_message(self.db, user_id, "user", user_message),
             save_message(self.db, user_id, "assistant", answer),
@@ -447,21 +452,21 @@ class FinancialAgent:
         return answer
 
     async def _safe_tool_call(self, tc: Any, user_id: int, query: str) -> dict:
-        """Execute one tool with full fallback chain — never raises."""
+        """Execute one tool — never raises, always returns something useful."""
         name = tc.function.name
         try:
             args = json.loads(tc.function.arguments)
         except Exception:
             args = {}
         try:
-            return await call_tool_with_fallback(name, args, user_id, query, self.db)
+            return await _call_tool_with_fallback(name, args, user_id, query, self.db)
         except Exception as e:
-            logger.error(f"Tool {name} failed completely: {e}")
-            # Last resort — web search with the original query
+            logger.error(f"Tool {name} completely failed: {e}")
+            # Absolute last resort
             try:
                 return await _web_search_fallback(query, name)
             except Exception:
                 return {
-                    "error": f"Tool {name} unavailable",
-                    "note": "Data temporarily unavailable. Please try again shortly."
+                    "note": "Data temporarily unavailable.",
+                    "suggestion": "Try rephrasing with a specific ticker like TSLA or AAPL"
                 }
