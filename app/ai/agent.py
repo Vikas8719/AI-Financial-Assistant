@@ -35,7 +35,7 @@ from app.services.sec_edgar import SecEdgarService
 from app.services.web_search import WebSearchService
 from app.services.compare_service import smart_compare, smart_compare_multi, resolve_ticker
 
-MAIN_MODEL  = "llama-3.3-70b-versatile"
+MAIN_MODEL  = "openai/gpt-oss-120b"
 
 main_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 finnhub     = FinnhubService()

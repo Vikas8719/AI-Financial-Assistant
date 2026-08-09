@@ -1,8 +1,8 @@
 """
-LLM Reranker — llama-3.1-8b-instant on Groq
+LLM Reranker — openai/gpt-os-20b on Groq
 ─────────────────────────────────────────────────────────────────
 Speed optimizations:
-  ✅ llama-3.1-8b-instant  (fastest Groq model, ~0.3s)
+  ✅ openai/gpt-os-20b  (fastest Groq model, ~0.3s)
   ✅ max_tokens=60          (score array only — was 100)
   ✅ Skip reranking if chunks <= 3 (BM25 scores enough)
   ✅ Timeout=4s             (was 8s — fail fast, BM25 fallback)
@@ -14,7 +14,7 @@ import re
 from groq import AsyncGroq
 from app.config import settings
 
-RERANKER_MODEL   = "llama-3.1-8b-instant"   # Fastest Groq model
+RERANKER_MODEL   = "openai/gpt-oss-20b"   # Fastest Groq model
 RERANKER_TIMEOUT = 4.0                        # Fail fast → BM25 fallback
 
 reranker_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
@@ -27,7 +27,7 @@ async def rerank_chunks(
     context_hint: str = ""
 ) -> list[dict]:
     """
-    Rerank BM25 chunks with llama-3.1-8b-instant.
+    Rerank BM25 chunks with openai/gpt-oss-20b.
     Skip if chunks <= 3 (BM25 order is good enough).
     """
     if not chunks:
