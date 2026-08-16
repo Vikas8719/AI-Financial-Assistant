@@ -3,8 +3,8 @@ Main AI Agent — Smart Model Fallback
 ─────────────────────────────────────────────────────────────────
 Rate Limit Strategy:
   Primary:  openai/gpt-oss-120b  (best quality, 200K TPD)
-  Fallback: llama-3.3-70b-versatile (good quality, separate 200K TPD)
-  Last:     llama-3.1-8b-instant    (fast, unlimited-ish, basic)
+  Fallback: qwen/qwen3.6-27b (good quality, separate 200K TPD)
+  Last:     openai/gpt-oss-20b    (fast, unlimited-ish, basic)
 
 Jab primary model 429 de → automatically fallback use hota hai.
 User ko pata bhi nahi chalta — seamless experience.
@@ -15,7 +15,7 @@ model use hota tha, us fallback call mein tools bhi nahi jaate the —
 isliye bot real-time stock/news tools call hi nahi kar paata tha aur
 khud keh deta tha "mujhe real-time data ka access nahi hai", jabki
 Finnhub/Yahoo/web-search services bilkul sahi kaam kar rahe the.
-Groq ke teeno models (gpt-oss-120b, llama-3.3-70b-versatile,
+Groq ke teeno models (gpt-oss-120b, qwen/qwen3.6-27b,
 llama-3.1-8b-instant) tool-calling support karte hain, isliye ab
 tools hamesha pass honge, chahe kaunsa bhi model cascade mein use ho.
 ─────────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ logger = logging.getLogger("finbot.agent")
 
 # ── Model cascade — primary → fallback → last resort ──────────
 PRIMARY_MODEL  = "openai/gpt-oss-120b"
-FALLBACK_MODEL = "llama-3.3-70b-versatile"   # Separate TPD pool
+FALLBACK_MODEL = "qwen/qwen3.6-27b"   # Separate TPD pool
 FAST_MODEL     = "llama-3.1-8b-instant"       # Near-unlimited, basic quality
 RERANKER_MODEL = "openai/gpt-oss-20b"
 

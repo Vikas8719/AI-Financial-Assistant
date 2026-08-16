@@ -27,3 +27,4 @@ Thumbs.db
 # Ngrok
 ngrok.exe
 ngrok.yml
+ _ai_progress.json
